@@ -72,7 +72,7 @@ from lerobot.datasets.video_utils import (
     VideoFrame,
     concatenate_video_files,
     decode_video_frames,
-    encode_video_frames,
+    encode_video_frames2,
     get_safe_default_codec,
     get_video_duration_in_s,
     get_video_info,
@@ -556,8 +556,14 @@ def _encode_video_worker(
     temp_path = Path(tempfile.mkdtemp(dir=root)) / f"{video_key}_{episode_index:03d}.mp4"
     fpath = DEFAULT_IMAGE_PATH.format(image_key=video_key, episode_index=episode_index, frame_index=0)
     img_dir = (root / fpath).parent
-    encode_video_frames(
-        img_dir, temp_path, fps, vcodec=vcodec, overwrite=True, encoder_threads=encoder_threads
+    # encode_video_frames(
+    #     img_dir, temp_path, fps, vcodec=vcodec, overwrite=True, encoder_threads=encoder_threads
+    # )
+    encode_video_frames2(
+        img_dir, temp_path, fps,
+                        # vcodec="h264_nvenc",
+                        # g=None,          # NVENC 通常不需要你手动设 GOP
+                        # crf=None,        # NVENC 不用 CRF vcodec=vcodec, overwrite=True
     )
     shutil.rmtree(img_dir)
     return temp_path
@@ -1161,12 +1167,17 @@ class LeRobotDataset(torch.utils.data.Dataset):
     def _save_image(
         self, image: torch.Tensor | np.ndarray | PIL.Image.Image, fpath: Path, compress_level: int = 1
     ) -> None:
-        if self.image_writer is None:
-            if isinstance(image, torch.Tensor):
-                image = image.cpu().numpy()
-            write_image(image, fpath, compress_level=compress_level)
-        else:
-            self.image_writer.save_image(image=image, fpath=fpath, compress_level=compress_level)
+        
+        with open(fpath, "wb") as f:
+            f.write(image.tobytes())
+        return
+
+        # if self.image_writer is None:
+        #     if isinstance(image, torch.Tensor):
+        #         image = image.cpu().numpy()
+        #     write_image(image, fpath, compress_level=compress_level)
+        # else:
+        #     self.image_writer.save_image(image=image, fpath=fpath, compress_level=compress_level)
 
     def add_frame(self, frame: dict) -> None:
         """
@@ -1179,7 +1190,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             if isinstance(frame[name], torch.Tensor):
                 frame[name] = frame[name].numpy()
 
-        validate_frame(frame, self.features)
+        # validate_frame(frame, self.features)
 
         if self.episode_buffer is None:
             self.episode_buffer = self.create_episode_buffer()

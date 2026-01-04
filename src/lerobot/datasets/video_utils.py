@@ -299,6 +299,91 @@ def decode_video_frames_torchcodec(
 
     return closest_frames
 
+import subprocess
+import shlex
+
+def encode_video_frames2(
+    imgs_dir,
+    video_path,
+    fps,
+    vcodec="libsvtav1",
+    pix_fmt="yuv420p",
+    g=2,
+    crf=30,
+    fast_decode=0,
+    log_level=None,
+    overwrite=False,
+    preset=None,
+) -> None:
+    video_path = Path(video_path)
+    imgs_dir = Path(imgs_dir)
+
+    if video_path.exists() and not overwrite:
+        logging.warning(f"Video file already exists: {video_path}. Skipping encoding.")
+        return
+
+    video_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 输入序列（你现在就是 frame-000000.jpg 这种）
+    input_pattern = str(imgs_dir / "frame-%06d.jpg")
+
+    # codec 名称映射：PyAV 用 "h264"/"hevc"，ffmpeg 要 "libx264"/"libx265"
+    ff_vcodec = vcodec
+    if vcodec == "h264":
+        ff_vcodec = "libx264"
+    elif vcodec == "hevc":
+        ff_vcodec = "libx265"
+
+    cmd = ["ffmpeg"]
+    if overwrite:
+        cmd += ["-y"]
+    else:
+        cmd += ["-n"]
+
+    # 读 jpg 序列
+    cmd += ["-hide_banner", "-loglevel", "error", "-framerate", str(fps), "-i", input_pattern]
+
+    # （可选）如果你想输出 224x224 并且不变形：取消注释这一行
+    # cmd += ["-vf", "scale=224:224:force_original_aspect_ratio=increase,crop=224:224"]
+
+    cmd += ["-vf", "scale=640:480"]
+
+    # 编码参数
+    cmd += ["-c:v", ff_vcodec, "-pix_fmt", pix_fmt]
+
+    if g is not None:
+        cmd += ["-g", str(g)]
+
+    # 质量参数：libx264/libx265/libsvtav1 用 crf
+    if crf is not None and ff_vcodec in ("libx264", "libx265", "libsvtav1", "libaom-av1"):
+        cmd += ["-crf", str(crf)]
+
+    # preset：x264/x265 是字符串；svtav1 是数字（你现在 preset 是 int）
+    if preset is not None:
+        if ff_vcodec in ("libx264", "libx265"):
+            # 你传 int 的话就简单映射到常用档位（可按需改）
+            preset_map = {1: "veryslow", 2: "slow", 3: "medium", 4: "fast", 5: "veryfast", 6: "superfast", 7: "ultrafast"}
+            cmd += ["-preset", preset_map.get(int(preset), "veryfast")]
+        elif ff_vcodec == "libsvtav1":
+            cmd += ["-preset", str(preset)]
+
+    # fast_decode：svtav1 专用参数（可选）
+    if fast_decode and ff_vcodec == "libsvtav1":
+        cmd += ["-svtav1-params", f"fast-decode={int(fast_decode)}"]
+
+    cmd += [str(video_path)]
+
+    # subprocess.run(cmd, check=True)
+
+    import subprocess
+    import time
+
+    t0 = time.perf_counter()
+    subprocess.run(cmd, check=True)
+    dt = time.perf_counter() - t0
+
+    print(f"cmd finished in {dt:.3f} s")
+
 
 def encode_video_frames(
     imgs_dir: Path | str,

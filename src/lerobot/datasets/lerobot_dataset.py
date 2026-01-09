@@ -556,16 +556,13 @@ def _encode_video_worker(
     temp_path = Path(tempfile.mkdtemp(dir=root)) / f"{video_key}_{episode_index:03d}.mp4"
     fpath = DEFAULT_IMAGE_PATH.format(image_key=video_key, episode_index=episode_index, frame_index=0)
     img_dir = (root / fpath).parent
-    # encode_video_frames(
-    #     img_dir, temp_path, fps, vcodec=vcodec, overwrite=True, encoder_threads=encoder_threads
-    # )
-    encode_video_frames2(
-        img_dir, temp_path, fps,
+    encode_video_frames2(img_dir, temp_path, fps,
                         # vcodec="h264_nvenc",
                         # g=None,          # NVENC 通常不需要你手动设 GOP
                         # crf=None,        # NVENC 不用 CRF vcodec=vcodec, overwrite=True
     )
     shutil.rmtree(img_dir)
+    # print("temp_path",temp_path)
     return temp_path
 
 
@@ -1333,9 +1330,15 @@ class LeRobotDataset(torch.utils.data.Dataset):
                     results = {}
                     for future in concurrent.futures.as_completed(future_to_key):
                         video_key = future_to_key[future]
+                        # print("future",future.result())
+                        # print("video_key",video_key)
                         try:
-                            temp_path = future.result()
+                            temp_path,statistics = future.result()
                             results[video_key] = temp_path
+                            ep_stats[video_key]["mean"][:] = statistics["mean"]/255.0
+                            ep_stats[video_key]["std"][:] = statistics["std"]/255.0
+
+
                         except Exception as exc:
                             logging.error(f"Video encoding failed for {video_key}: {exc}")
                             raise exc
@@ -1343,23 +1346,22 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 for video_key in self.meta.video_keys:
                     temp_path = results[video_key]
                     ep_metadata.update(
-                        self._save_episode_video(video_key, episode_index, temp_path=temp_path)
+                        self._save_episode_video(video_key, episode_index, temp_path=temp_path)[0]
                     )
             else:
                 for video_key in self.meta.video_keys:
-                    ep_metadata.update(self._save_episode_video(video_key, episode_index))
+                    m,statistics=self._save_episode_video(video_key, episode_index)
+                    ep_metadata.update(m)
+                    ep_stats[video_key]["mean"][:] = statistics["mean"]/255.0
+                    ep_stats[video_key]["std"][:] = statistics["std"]/255.0
+
+        
+        # print(ep_stats)
 
         # `meta.save_episode` need to be executed after encoding the videos
         self.meta.save_episode(episode_index, episode_length, episode_tasks, ep_stats, ep_metadata)
 
-        if has_video_keys and use_batched_encoding:
-            # Check if we should trigger batch encoding
-            self.episodes_since_last_encoding += 1
-            if self.episodes_since_last_encoding == self.batch_encoding_size:
-                start_ep = self.num_episodes - self.batch_encoding_size
-                end_ep = self.num_episodes
-                self._batch_save_episode_video(start_ep, end_ep)
-                self.episodes_since_last_encoding = 0
+
 
         if not episode_data:
             # Reset episode buffer and clean up temporary images (if not already deleted during video encoding)
@@ -1379,6 +1381,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         logging.info(
             f"Batch encoding {self.batch_encoding_size} videos for episodes {start_episode} to {end_episode - 1}"
         )
+        # print("self.meta######",self.meta)
 
         chunk_idx = self.meta.episodes[start_episode]["data/chunk_index"]
         file_idx = self.meta.episodes[start_episode]["data/file_index"]
@@ -1518,9 +1521,10 @@ class LeRobotDataset(torch.utils.data.Dataset):
         episode_index: int,
         temp_path: Path | None = None,
     ) -> dict:
+        statistics=None
         # Encode episode frames into a temporary video
         if temp_path is None:
-            ep_path = self._encode_temporary_episode_video(video_key, episode_index)
+            ep_path,statistics = self._encode_temporary_episode_video(video_key, episode_index)
         else:
             ep_path = temp_path
 
@@ -1591,7 +1595,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             f"videos/{video_key}/from_timestamp": latest_duration_in_s,
             f"videos/{video_key}/to_timestamp": latest_duration_in_s + ep_duration_in_s,
         }
-        return metadata
+        return metadata,statistics
 
     def clear_episode_buffer(self, delete_images: bool = True) -> None:
         # Cancel streaming encoder if active

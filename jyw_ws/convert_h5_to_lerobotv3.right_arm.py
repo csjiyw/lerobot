@@ -229,14 +229,13 @@ def generate_frames_from_h5_no_prev(
         yield frame
 
 
-def main():
-    assert data_home.exists(), f"data_home not found: {data_home}"
 
+def clear_old_folder():
     out_root = Path(HF_LEROBOT_HOME) / REPO_ID
     if WIPE_OUTPUT and out_root.exists():
         shutil.rmtree(out_root)
 
-    # 找到所有 <id>/<id>.h5
+def get_episode_path():
     h5_files: list[Path] = []
     for p in sorted(data_home.iterdir()):
         if not p.is_dir():
@@ -245,6 +244,16 @@ def main():
         fp = p / f"{hid}.h5"
         if fp.exists():
             h5_files.append(fp)
+    
+    return h5_files
+
+def main():
+    assert data_home.exists(), f"data_home not found: {data_home}"
+
+    clear_old_folder()
+
+    # 找到所有 <id>/<id>.h5
+    h5_files=get_episode_path()
 
     # 只用前 10 个测试
     # h5_files = h5_files[:10]

@@ -511,7 +511,7 @@ def encode_video_frames2(
     # print(p.stdout)
     # print("#########")
 
-    print(p.stderr)
+    # print(p.stderr)
 
 
     pat = re.compile(r"mean:\[(\d+)\s+(\d+)\s+(\d+)\]\s+stdev:\[([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\]")

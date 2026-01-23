@@ -473,6 +473,8 @@ def get_feature_stats(
     stats = _reshape_stats_by_axis(stats, axis, keepdims, original_shape)
     return stats
 
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1)
+IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 1)
 
 def compute_episode_stats(
     episode_data: dict[str, list[str] | np.ndarray],
@@ -509,22 +511,43 @@ def compute_episode_stats(
             continue
 
         if features[key]["dtype"] in ["image", "video"]:
-            ep_ft_array = sample_images(data)
-            axes_to_reduce = (0, 2, 3)
-            keepdims = True
+            # ep_ft_array = sample_images(data)
+            # axes_to_reduce = (0, 2, 3)
+            # keepdims = True
+            ...
+            if isinstance(data, list):
+                n = len(data)
+            else:
+                n = int(data.shape[0])
+            ep_stats[key] ={
+                "min":  np.zeros((3,1,1), dtype=np.float32),
+                "max":  np.ones((3,1,1), dtype=np.float32),
+                "mean": IMAGENET_MEAN.copy(),
+                "std":  IMAGENET_STD.copy(),
+                "count": np.asarray([n], dtype=np.int64),
+
+                # quantiles：保持 key & shape，只给合理占位值
+                # "q01": np.zeros((3,1,1), dtype=np.float32),
+                # "q10": np.zeros((3,1,1), dtype=np.float32),
+                # "q50": IMAGENET_MEAN.copy(),   # 中位数≈均值（合理）
+                # "q90": np.ones((3,1,1), dtype=np.float32),
+                # "q99": np.ones((3,1,1), dtype=np.float32),
+            }
         else:
             ep_ft_array = data
             axes_to_reduce = 0
             keepdims = data.ndim == 1
 
-        ep_stats[key] = get_feature_stats(
-            ep_ft_array, axis=axes_to_reduce, keepdims=keepdims, quantile_list=quantile_list
-        )
+            ep_stats[key] = get_feature_stats(
+                ep_ft_array, axis=axes_to_reduce, keepdims=keepdims, quantile_list=quantile_list
+            )
 
-        if features[key]["dtype"] in ["image", "video"]:
-            ep_stats[key] = {
-                k: v if k == "count" else np.squeeze(v / 255.0, axis=0) for k, v in ep_stats[key].items()
-            }
+        # if features[key]["dtype"] in ["image", "video"]:
+        #     ep_stats[key] = {
+        #         k: v if k == "count" else np.squeeze(v / 255.0, axis=0) for k, v in ep_stats[key].items()
+        #     }
+
+        #     print(ep_stats)
 
     return ep_stats
 

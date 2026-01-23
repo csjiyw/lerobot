@@ -31,6 +31,10 @@ import torch
 import torchvision
 from datasets.features.features import register_feature
 from PIL import Image
+import subprocess,re
+import time
+import shlex
+import numpy as np
 
 
 def get_safe_default_codec():
@@ -298,6 +302,196 @@ def decode_video_frames_torchcodec(
         )
 
     return closest_frames
+
+
+import os
+W = int(os.getenv("LEROBOT_W", "640"))
+H = int(os.getenv("LEROBOT_H", "480"))
+
+def encode_video_frames2(
+    imgs_dir,
+    video_path,
+    fps,
+    vcodec="libsvtav1",
+    pix_fmt="yuv420p",
+    g=2,
+    crf=30,
+    fast_decode=0,
+    log_level=None,
+    overwrite=False,
+    preset=None,
+):
+    video_path = Path(video_path)
+    imgs_dir = Path(imgs_dir)
+
+    if video_path.exists() and not overwrite:
+        logging.warning(f"Video file already exists: {video_path}. Skipping encoding.")
+        return
+
+    video_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 输入序列（你现在就是 frame-000000.jpg 这种）
+    input_pattern = str(imgs_dir / "frame-%06d.jpg")
+
+    # codec 名称映射：PyAV 用 "h264"/"hevc"，ffmpeg 要 "libx264"/"libx265"
+    ff_vcodec = vcodec
+    if vcodec == "h264":
+        ff_vcodec = "libx264"
+    elif vcodec == "hevc":
+        ff_vcodec = "libx265"
+
+    cmd = ["ffmpeg"]
+    if overwrite:
+        cmd += ["-y"]
+    else:
+        cmd += ["-n"]
+
+    # 读 jpg 序列
+    cmd += ["-hide_banner", "-loglevel", "info", "-framerate", str(fps), "-i", input_pattern]
+
+    # （可选）如果你想输出 224x224 并且不变形：取消注释这一行
+    # cmd += ["-vf", "scale=224:224:force_original_aspect_ratio=increase,crop=224:224"]
+
+
+    # cmd +=  ["-filter_complex",
+    #     "[0:v]scale=224:224,split=2[v_rgb][v_yuv]; \
+    #     [v_rgb]format=gbrp,geq=r=255:g=0:b=128,showinfo,metadata=print,nullsink; \
+    #     [v_yuv]format=yuv420p[out]" ]
+    
+    cmd +=  ["-filter_complex",
+        f"[0:v]scale={W}:{H},split=2[v_rgb][v_yuv]; \
+        [v_rgb]format=gbrp,showinfo,nullsink; \
+        [v_yuv]format={pix_fmt}[out]" ]
+
+
+    cmd += ["-map", "[out]" ]
+
+    # 编码参数
+    cmd += ["-c:v", ff_vcodec, "-pix_fmt", pix_fmt]
+
+    if g is not None:
+        cmd += ["-g", str(g)]
+
+    # 质量参数：libx264/libx265/libsvtav1 用 crf
+    if crf is not None and ff_vcodec in ("libx264", "libx265", "libsvtav1", "libaom-av1"):
+        cmd += ["-crf", str(crf)]
+
+    # preset：x264/x265 是字符串；svtav1 是数字（你现在 preset 是 int）
+    if preset is not None:
+        if ff_vcodec in ("libx264", "libx265"):
+            # 你传 int 的话就简单映射到常用档位（可按需改）
+            preset_map = {1: "veryslow", 2: "slow", 3: "medium", 4: "fast", 5: "veryfast", 6: "superfast", 7: "ultrafast"}
+            cmd += ["-preset", preset_map.get(int(preset), "veryfast")]
+        elif ff_vcodec == "libsvtav1":
+            cmd += ["-preset", str(preset)]
+
+    # fast_decode：svtav1 专用参数（可选）
+    if fast_decode and ff_vcodec == "libsvtav1":
+        cmd += ["-svtav1-params", f"fast-decode={int(fast_decode)}"]
+
+    cmd += [str(video_path)]
+
+    # subprocess.run(cmd, check=True)
+
+    
+
+    t0 = time.perf_counter()
+    # p=subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,text=True)
+
+
+    try:
+        p = subprocess.run(
+            cmd,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="replace",
+        )
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(
+            "ffmpeg failed\n"
+            f"CMD: {' '.join(cmd)}\n"
+            f"STDERR:\n{e.stderr[-4000:]}"   # 打最后 4000 字符就够定位
+        ) from e
+    dt = time.perf_counter() - t0
+
+    log = p.stderr
+
+    # 收集逐帧 R/G/B 的平均值
+    R, G, B = [], [], []
+
+    # print(p.stdout)
+    # print("#########")
+
+    # print(p.stderr)
+
+
+    pat = re.compile(r"mean:\[(\d+)\s+(\d+)\s+(\d+)\]\s+stdev:\[([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\]")
+
+    sum_G = sum_B = sum_R = 0.0
+    sum_G2 = sum_B2 = sum_R2 = 0.0
+    n = 0
+
+    for line in log.splitlines():
+        m = pat.search(line)
+        if not m:
+            continue
+
+        Gm, Bm, Rm = map(float, m.group(1,2,3))
+        Gs, Bs, Rs = map(float, m.group(4,5,6))
+
+        # accumulate first moment
+        sum_G += Gm; sum_B += Bm; sum_R += Rm
+
+        # accumulate second moment: E[x^2] = std^2 + mean^2
+        sum_G2 += Gs*Gs + Gm*Gm
+        sum_B2 += Bs*Bs + Bm*Bm
+        sum_R2 += Rs*Rs + Rm*Rm
+
+        n += 1
+
+    mean_G = sum_G / n
+    mean_B = sum_B / n
+    mean_R = sum_R / n
+
+    Ex2_G = sum_G2 / n
+    Ex2_B = sum_B2 / n
+    Ex2_R = sum_R2 / n
+
+    std_G = np.sqrt(max(0.0, Ex2_G - mean_G*mean_G))
+    std_B = np.sqrt(max(0.0, Ex2_B - mean_B*mean_B))
+    std_R = np.sqrt(max(0.0, Ex2_R - mean_R*mean_R))
+
+    rgb_mean = {"R": mean_R, "G": mean_G, "B": mean_B}
+    rgb_std  = {"R": std_R,  "G": std_G,  "B": std_B}
+    # print(rgb_mean)
+    # print(rgb_std)
+
+    mean = np.array(
+        [[[rgb_mean["R"]]],
+        [[rgb_mean["G"]]],
+        [[rgb_mean["B"]]]],
+        dtype=np.float32
+    )
+
+    std = np.array(
+        [[[rgb_std["R"]]],
+        [[rgb_std["G"]]],
+        [[rgb_std["B"]]]],
+        dtype=np.float32
+    )
+
+    statistics = {
+        "mean": mean,
+        "std": std,
+    }
+
+
+
+    return statistics
+
+    # print(f"cmd finished in {dt:.3f} s")
 
 
 def encode_video_frames(

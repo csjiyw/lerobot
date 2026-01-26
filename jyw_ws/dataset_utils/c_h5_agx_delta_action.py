@@ -17,19 +17,17 @@ from lerobot.utils.constants import HF_LEROBOT_HOME
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from tqdm import tqdm
 
-H=480
-W=640
+H=224
+W=224
 
 # 原始相机键 -> 目标相机键
 CAM_KEYMAP = {
     "/camera/color/front": "observation.images.head",
-    "/camera/color/left": "observation.images.hand_left",
     "/camera/color/right": "observation.images.hand_right",
 }
 
 # —— 关节命名（每臂6关节 + 夹爪1）——
 DEFAULT_MOTORS_BOTH14 = (
-    [f"J_arm_l_0{i}" if i < 10 else f"J_arm_l_{i}" for i in range(1, 7)] + ["J_gripper_l"] +
     [f"J_arm_r_0{i}" if i < 10 else f"J_arm_r_{i}" for i in range(1, 7)] + ["J_gripper_r"]
 )
 
@@ -75,12 +73,14 @@ def build_features_dict(cams, state_dim, motors_names, fps):
         "observation.state": {
             "dtype": "float32",
             "shape": (state_dim,),
-            "names": motors_names
+            "names": motors_names,
+            "fps":30
         },
         "action": {
             "dtype": "float32",
             "shape": (state_dim,),
-            "names": motors_names
+            "names": motors_names,
+            "fps":30
         }
     }
     vid_info = {
@@ -104,11 +104,36 @@ def build_features_dict(cams, state_dim, motors_names, fps):
         }
     return feats
 
+
+def find_last_state_motion_index(states: np.ndarray, eps: float = 1e-4):
+    """
+    states: (T, S)
+    返回最后一次明显变化发生在 t（表示 t 相对 t-1 有变化）
+    """
+    T = states.shape[0]
+    if T < 2:
+        return None
+
+    # 每一步最大维度变化量
+    diffs = np.max(np.abs(states[1:] - states[:-1]), axis=1)  # (T-1,)
+    idx = np.where(diffs > eps)[0]
+    if len(idx) == 0:
+        return None
+    return int(idx[-1] + 1)  # +1 对应 states 的索引
+
+def compute_trim_end_by_state(states: np.ndarray, tail_keep: int = 20, eps: float = 1e-4):
+    T = states.shape[0]
+    last_motion = find_last_state_motion_index(states, eps=eps)
+    if last_motion is None:
+        return min(tail_keep, T)
+    return min(last_motion + tail_keep + 1, T)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Convert episodes to LeRobot v2 (both14).")
 
     parser.add_argument("--expert_data_num", type=int,default=0, help="number of episodes to process")
-    parser.add_argument("--repo_id", type=str, default="jyw/pick_yellow_box")
+    parser.add_argument("--repo_id", type=str, default="jyw/pick_yellow_box224_right2_delta_action")
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--root", type=str, default="/workspace/data/data_no_index", help="source root")
     args = parser.parse_args()
@@ -127,7 +152,7 @@ def main():
     std_cam_list = sorted([CAM_KEYMAP.get(k, k) for k in images0.keys()])
 
     # 14 维： (6+1) * 2
-    state_dim   = 14
+    state_dim   = 7
     motor_names = DEFAULT_MOTORS_BOTH14
 
     feats = build_features_dict(
@@ -142,8 +167,8 @@ def main():
         robot_type="agelix",
         fps=args.fps,
         features=feats,
-        image_writer_threads=20,
-        image_writer_processes=10,
+        image_writer_threads=4,
+        image_writer_processes=8,
     )
 
     print(f"[INFO] HF_LEROBOT_HOME = {HF_LEROBOT_HOME}")
@@ -152,6 +177,8 @@ def main():
     print(f"[INFO] State dim        = {state_dim} (6+grip)*2")
 
     from tqdm import trange
+
+    
 
 
     def _discover_episode_ids(data_dir: str) -> list[int]:
@@ -184,26 +211,39 @@ def main():
    
         l_a, l_s, r_a, r_s, images = load_episode_h5(h5_path)
 
+        end = compute_trim_end_by_state(
+            r_a.astype(np.float32),
+            tail_keep=1,          # 你可以改 30
+            eps=1e-2,              # 视你动作量级可调
+        )
+
+        
+
         T = l_a.shape[0]
         if T < 2:
             print(f"[WARN] episode{epi} too short (T={T}), skip")
             continue
+        
+        print(epi,T,T-end)
 
-        for t in range(T):
+        for t in range(end-1):
             # 左臂6 + 左夹爪1 + 右臂6 + 右夹爪1  → 14维
             state_t = np.concatenate([
-                l_s[t].astype(np.float32),
                 r_s[t].astype(np.float32),
             ], axis=0)
 
-            action_t = np.concatenate([
-                l_a[t].astype(np.float32),  
-                r_a[t].astype(np.float32), 
-            ], axis=0)
+             # delta action = 下一时刻 target - 当前 state
+            delta_action_t = (
+                r_a[t + 1].astype(np.float32) 
+                - r_s[t].astype(np.float32)
+            )
+
+            # （可选）clip，强烈建议
+            delta_action_t = np.clip(delta_action_t, -0.1, 0.1)
 
             frame = {
                 "observation.state": state_t,
-                "action": action_t,
+                "action": delta_action_t,
             }
             for raw_cam, seq in images.items():
                 std_cam = CAM_KEYMAP.get(raw_cam, raw_cam)

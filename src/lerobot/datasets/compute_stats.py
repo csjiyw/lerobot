@@ -212,7 +212,7 @@ def estimate_num_samples(
 
 
 def sample_indices(data_len: int) -> list[int]:
-    num_samples = estimate_num_samples(data_len)
+    num_samples = 10#estimate_num_samples(data_len)
     return np.round(np.linspace(0, data_len - 1, num_samples)).astype(int).tolist()
 
 

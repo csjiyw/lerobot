@@ -19,7 +19,7 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 # ===================== 用户配置 =====================
 data_home = Path("data/rclone-v1.68.2-linux-amd64/data/9f22b6b23ed64ced8fc8074d454e5672")
 
-REPO_ID = "jyw/your_dataset_name"   # 输出到: HF_LEROBOT_HOME/REPO_ID
+REPO_ID = "jyw/place_metallic_object_fast_right_arm"   # 输出到: HF_LEROBOT_HOME/REPO_ID
 ROBOT_TYPE = "generic"
 FPS = 30
 TASK_NAME = "place metallic object"
@@ -27,7 +27,7 @@ WIPE_OUTPUT = True
 START_FRAME = 0
 
 USE_HEAD_CAM = True
-USE_HAND_LEFT_CAM = True
+USE_HAND_LEFT_CAM = False
 USE_HAND_RIGHT_CAM = True
 
 # 是否把 state 也包含 velocity / angular（你现在的 H5 都有，这里默认全用）
@@ -110,22 +110,23 @@ def build_feature_spec(sample_h5: Path):
         head_hw = None
         hl_hw = None
         hr_hw = None
+        H,W=480,640
 
 
         if USE_HEAD_CAM:
             
-            head_hw = (224,224)  # (H,W)
+            head_hw = (H,W)  # (H,W)
         if USE_HAND_LEFT_CAM:
             
-            hl_hw = (224,224)
+            hl_hw = (H,W)
         if USE_HAND_RIGHT_CAM:
             
-            hr_hw = (224,224)
+            hr_hw = (H,W)
 
         # state/action dim：拼一次即可
         s0, a0 = build_state_action(f, 0)
-        state_dim = int(s0.shape[0])
-        action_dim = int(a0.shape[0])
+        state_dim = 7#int(s0.shape[0])
+        action_dim = 7#int(a0.shape[0])
 
     feats = {}
     if USE_HEAD_CAM and head_hw is not None:
@@ -142,20 +143,7 @@ def build_feature_spec(sample_h5: Path):
                        "video.channels": 3,
                          "has_audio": False}
         }
-    if USE_HAND_LEFT_CAM and hl_hw is not None:
-        H, W = hl_hw
-        feats["observation.images.hand_left"] = {
-            "dtype": "video",
-            "shape": (3, H, W),
-            "names": ["channels", "height", "width"],
-            "info":  {"video.height": H, "video.width": W,
-                      "video.codec": "av1",
-                      "video.pix_fmt": "yuv420p",
-                        "video.is_depth_map": False,
-                     "video.fps": FPS,
-                       "video.channels": 3,
-                         "has_audio": False}
-        }
+
     if USE_HAND_RIGHT_CAM and hr_hw is not None:
         H, W = hr_hw
         feats["observation.images.hand_right"] = {
@@ -188,10 +176,9 @@ def build_feature_spec(sample_h5: Path):
 def generate_frames_from_h5_no_prev(
     f,
     T: int,
-    decode_image_fn,
     task_name: str,
     collection_id: str,
-    use_base: bool = True,   # 是否把底盘(velocity+angular)拼进 state/action
+    use_base: bool = False,   # 是否把底盘(velocity+angular)拼进 state/action
 ):
     d_head = f["cameras/head/color/data"] if "cameras/head/color/data" in f else None
     d_hl   = f["cameras/hand_left/color/data"] if "cameras/hand_left/color/data" in f else None
@@ -220,30 +207,21 @@ def generate_frames_from_h5_no_prev(
 
         if d_head is not None:
             frame["observation.images.head"] = (d_head[t])
-        if d_hl is not None:
-            frame["observation.images.hand_left"] = (d_hl[t])
+        # if d_hl is not None:
+        #     frame["observation.images.hand_left"] = (d_hl[t])
         if d_hr is not None:
             frame["observation.images.hand_right"] = (d_hr[t])
 
         # observation.state: 直接用 state 的当前帧
         obs = [
-            np.asarray(s_arm_p[t], dtype=np.float32).reshape(-1),
-            np.asarray(s_eff_p[t], dtype=np.float32).reshape(-1),
+            np.asarray(s_arm_p[t][6:], dtype=np.float32).reshape(-1),
+            np.asarray(s_eff_p[t][1:], dtype=np.float32).reshape(-1),
         ]
         act = [
-            np.asarray(a_arm_p[t], dtype=np.float32).reshape(-1),
-            np.asarray(a_eff_p[t], dtype=np.float32).reshape(-1),
+            np.asarray(a_arm_p[t][6:], dtype=np.float32).reshape(-1),
+            np.asarray(a_eff_p[t][1:], dtype=np.float32).reshape(-1),
         ]
 
-        if use_base:
-            obs += [
-                np.asarray(s_base_v[t], dtype=np.float32).reshape(-1),
-                np.asarray(s_base_w[t], dtype=np.float32).reshape(-1),
-            ]
-            act += [
-                np.asarray(a_base_v[t], dtype=np.float32).reshape(-1),
-                np.asarray(a_base_w[t], dtype=np.float32).reshape(-1),
-            ]
 
         frame["observation.state"] = np.concatenate(obs, axis=0).astype(np.float32)
         frame["action"] = np.concatenate(act, axis=0).astype(np.float32)
@@ -269,7 +247,7 @@ def main():
             h5_files.append(fp)
 
     # 只用前 10 个测试
-    # h5_files = h5_files[:2]
+    # h5_files = h5_files[:10]
 
     if not h5_files:
         raise RuntimeError(f"No <id>/<id>.h5 found under {data_home}")
@@ -296,7 +274,7 @@ def main():
                 f=f, T=T,
                 task_name=TASK_NAME,
                 collection_id=collection_id,
-                use_base=True,
+                use_base=False,
             ):
                 ds.add_frame(frame=frame)
         ds.save_episode()

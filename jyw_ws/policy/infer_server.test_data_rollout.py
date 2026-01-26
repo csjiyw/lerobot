@@ -13,7 +13,7 @@ import torch
 from torch.utils.data import DataLoader,Subset
 from tqdm import tqdm
 
-
+from lerobot.policies.factory import make_policy2
 from lerobot.policies.utils import get_device_from_parameters
 from lerobot.utils.io_utils import write_video
 from lerobot.utils.random_utils import set_seed
@@ -57,7 +57,7 @@ def eval_main(cfg: EvalPipelineConfig):
             }
 
     
-    dataset = LeRobotDataset(repo_id="jyw/place_metallic_object_fast",episodes=[0])
+    dataset = LeRobotDataset(repo_id="jyw/pick_yellow_box_test",episodes=[0])
     
     dataset_loader = DataLoader(
             dataset,
@@ -66,64 +66,6 @@ def eval_main(cfg: EvalPipelineConfig):
             # num_workers=4,
             # pin_memory=True,
         )
-
-    # test 
-
-    
-
-    def writer_process(config):
-
-        def img_float_to_int8(x):
-            y = (x * 255.0).round().clamp(0, 255).to(torch.uint8)
-            return y
-
-        subset = Subset(dataset, list(range(10)))
-
-        dataset_loader = DataLoader(
-            subset,
-            batch_size=1,#cfg.eval.batch_size,
-            shuffle=False,
-            # num_workers=4,
-            # pin_memory=True,
-        )
-        time.sleep(1)
-  
-        ipc1 = NetworkIPC("test", config, is_server=False)
-        for batch in dataset_loader:
-            print("client wait")
-            print("client turn")
-            
-            # print(f"[Reader] Received state: {state}")
-
-            x=batch['observation.images.head']
-            print(type(x), x.shape, x.dtype, x.device)
-
-            
-
-            ipc1.set("cam_front", img_float_to_int8(batch['observation.images.head']))
-            ipc1.set("cam_left", img_float_to_int8(batch['observation.images.hand_left']))
-            ipc1.set("cam_right", img_float_to_int8(batch['observation.images.hand_right']))
-            ipc1.set("state", batch['observation.state'])
-
-            ipc1.talk()
-
-            action = ipc1.get("action")
-
-            action_gt=batch['action']
-            diff= action_gt-action
-            print("diff",torch.mean(diff))
-            print("gt",action_gt)
-            print("pred",action)
-            print("client turn finish")
-
-            # time.sleep(0.5)
-        ipc1.close()
-    
-    writer = multiprocessing.Process(target=writer_process, args=(config,))
-    # writer.start()
-
-
-    ds_meta = dataset.meta
    
 
     logging.info("Making policy.")
@@ -148,9 +90,11 @@ def eval_main(cfg: EvalPipelineConfig):
 
     # init_act=np.array([[ 0.1768, -0.1400, -0.1749, -1.6732, -0.0633,  1.5029,  0.7946,  0.0400]])
 
+    from tqdm import tqdm
+
     with torch.inference_mode(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
         
-        while True:
+        for batch in tqdm(dataset_loader):
             # print("server wait")
             ipc.talk()
 
@@ -163,44 +107,11 @@ def eval_main(cfg: EvalPipelineConfig):
                 continue
 
             # print("server turn")
-            
-            cam_front = ipc.get("cam_front")
-            cam_left = ipc.get("cam_left")
-            cam_right=ipc.get("cam_right")
-            state=ipc.get("state")
-
-
-          
-
-
-            obs= {'observation.images.head': cam_front.astype(np.float32) / 255.0,
-                        'observation.images.hand_left':cam_left.astype(np.float32) / 255.0,
-                        'observation.images.hand_right':cam_right.astype(np.float32) / 255.0,
-                        'observation.state': state
-                        }
-            
-            obs = {k: torch.from_numpy(v).to(device, non_blocking=True) for k, v in obs.items()}
-            # observation_tensor["task"]="place green ball to blue plate"
-            
-
-            # from PIL import Image
-
-            # img = cam_front[0].transpose(1, 2, 0)   # RGB
-            # Image.fromarray(img, mode="RGB").save("data/cam_front.jpg")
-
-            # img = cam_left[0].transpose(1, 2, 0)   # RGB
-            # Image.fromarray(img, mode="RGB").save("data/cam_left.jpg")
-
-            # img = cam_right[0].transpose(1, 2, 0)   # RGB
-            # Image.fromarray(img, mode="RGB").save("data/cam_right.jpg")
-
-            print("state",state.reshape((2,7)))
-            # exit(0)
 
 
             # print("obs",observation['observation.state'].device)
  
-            obs = preprocess(obs)
+            obs = preprocess(batch)
 
             # use chunk
             action = model.predict_action_chunk(obs)

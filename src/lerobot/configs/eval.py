@@ -19,7 +19,7 @@ from pathlib import Path
 
 from lerobot import envs, policies  # noqa: F401
 from lerobot.configs import parser
-from lerobot.configs.default import EvalConfig
+from lerobot.configs.default import EvalConfig,DatasetConfig
 from lerobot.configs.policies import PreTrainedConfig
 
 logger = getLogger(__name__)
@@ -30,6 +30,7 @@ class EvalPipelineConfig:
     # Either the repo ID of a model hosted on the Hub or a path to a directory containing weights
     # saved using `Policy.save_pretrained`. If not provided, the policy is initialized from scratch
     # (useful for debugging). This argument is mutually exclusive with `--config`.
+    dataset: DatasetConfig | None = None
     env: envs.EnvConfig | None = None
     eval: EvalConfig = field(default_factory=EvalConfig)
     policy: PreTrainedConfig | None = None
@@ -38,6 +39,7 @@ class EvalPipelineConfig:
     seed: int | None = 1000
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
+    eval_dataset:bool | None = False
 
     def __post_init__(self) -> None:
         # HACK: We parse again the cli args here to get the pretrained path if there was one.

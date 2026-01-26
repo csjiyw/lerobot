@@ -299,6 +299,157 @@ def decode_video_frames_torchcodec(
 
     return closest_frames
 
+import subprocess
+
+def encode_video_frames2(
+    imgs_dir: Path | str,
+    video_path: Path | str,
+    fps: int,
+    vcodec: str = "libsvtav1",
+    pix_fmt: str = "yuv420p",
+    g: int | None = 2,
+    crf: int | None = 30,
+    fast_decode: int = 0,  # ffmpeg 里不完全等价，这里尽量映射
+    log_level=None,        # ffmpeg 自己有 -loglevel，这里不用 av.logging 了
+    overwrite: bool = False,
+    preset: int | None = None,  # svtav1 的 preset 0-13（小=慢高质，大=快）
+) -> None:
+    """
+    Encode frames in imgs_dir into a CFR video using ffmpeg.
+    Expects frame names: frame-000000.png ... frame-XXXXXX.png
+    """
+
+    if vcodec not in ["h264", "hevc", "libsvtav1"]:
+        raise ValueError(f"Unsupported video codec: {vcodec}. Supported codecs: h264, hevc, libsvtav1.")
+
+    imgs_dir = Path(imgs_dir)
+    video_path = Path(video_path)
+
+    if video_path.exists() and not overwrite:
+        logging.warning(f"Video file already exists: {video_path}. Skipping encoding.")
+        return
+
+    video_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Verify input frames exist
+    template = "frame-" + ("[0-9]" * 6) + ".png"
+    input_list = sorted(
+        glob.glob(str(imgs_dir / template)),
+        key=lambda x: int(x.split("-")[-1].split(".")[0])
+    )
+    if not input_list:
+        raise FileNotFoundError(f"No images found in {imgs_dir} with pattern {template}.")
+
+    # Get size from first frame (optional; ffmpeg can infer, but good for sanity)
+    with Image.open(input_list[0]) as im:
+        width, height = im.size
+
+    # Map codec names to ffmpeg encoders
+    if vcodec == "h264":
+        ff_vcodec = "libx264"
+    elif vcodec == "hevc":
+        ff_vcodec = "libx265"
+    else:
+        ff_vcodec = "libsvtav1"
+
+    # Pixel format compatibility
+    if (vcodec in ["libsvtav1", "hevc"]) and pix_fmt == "yuv444p":
+        logging.warning(f"Incompatible pixel format 'yuv444p' for codec {vcodec}, auto-selecting 'yuv420p'")
+        pix_fmt = "yuv420p"
+
+    # IMPORTANT: ffmpeg expects an *image sequence pattern* rather than a glob list
+    # Your frames are frame-%06d.png
+    input_pattern = str(imgs_dir / "frame-%06d.png")
+
+    # Build ffmpeg command for CFR video:
+    # -framerate sets input frame rate
+    # -r sets output CFR (keep identical to avoid VFR)
+    cmd = ["ffmpeg"]
+
+    # logging level
+    # choices: quiet, panic, fatal, error, warning, info, verbose, debug, trace
+    cmd += ["-loglevel", "error"]
+
+    # overwrite behavior
+    cmd += ["-y" if overwrite else "-n"]
+
+    # input framerate (CFR)
+    cmd += ["-framerate", str(int(fps))]
+
+    # input
+    cmd += ["-i", input_pattern]
+
+    # (optional) enforce size if you ever have inconsistent frames:
+    # cmd += ["-vf", f"scale={width}:{height}"]
+
+    # video codec
+    cmd += ["-c:v", ff_vcodec]
+
+    # GOP / keyframe interval
+    if g is not None:
+        cmd += ["-g", str(int(g))]
+
+    # CRF / quality knobs
+    if crf is not None:
+        if ff_vcodec == "libx264":
+            cmd += ["-crf", str(int(crf))]
+        elif ff_vcodec == "libx265":
+            cmd += ["-crf", str(int(crf))]
+        elif ff_vcodec == "libsvtav1":
+            # SVT-AV1 uses -crf too
+            cmd += ["-crf", str(int(crf))]
+
+    # Preset knobs
+    if ff_vcodec == "libx264":
+        # x264 preset: ultrafast..veryslow
+        # you passed an int; map roughly
+        if preset is not None:
+            # 0..13 -> ultrafast..veryslow (rough)
+            preset_map = [
+                "veryslow", "slower", "slow", "medium", "fast", "faster", "veryfast",
+                "superfast", "ultrafast", "ultrafast", "ultrafast", "ultrafast", "ultrafast", "ultrafast"
+            ]
+            cmd += ["-preset", preset_map[max(0, min(13, int(preset)))]]
+        else:
+            cmd += ["-preset", "medium"]
+    elif ff_vcodec == "libx265":
+        if preset is not None:
+            # x265 preset: ultrafast..placebo (0..9)
+            # map 0..13 to 0..9
+            p = int(round(max(0, min(13, int(preset))) * 9 / 13))
+            cmd += ["-preset", str(p)]
+        else:
+            cmd += ["-preset", "6"]
+    elif ff_vcodec == "libsvtav1":
+        # SVT-AV1 preset: 0..13 (lower=better quality slower; higher=faster)
+        cmd += ["-preset", str(int(preset) if preset is not None else 12)]
+
+        # fast_decode: best-effort mapping to svtav1 params
+        # ffmpeg supports -svtav1-params key=value:...
+        if fast_decode:
+            cmd += ["-svtav1-params", f"fast-decode={int(fast_decode)}"]
+
+    # Pixel format (important for compatibility)
+    cmd += ["-pix_fmt", pix_fmt]
+
+    # Force CFR output fps (this is the big one to avoid VFR weirdness)
+    cmd += ["-r", str(int(fps))]
+
+    # (Optional) make MP4 streaming-friendly; harmless for local too
+    # cmd += ["-movflags", "+faststart"]
+
+    # output path
+    cmd += [str(video_path)]
+
+    # Run
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    except subprocess.CalledProcessError as e:
+        # include stderr for debugging
+        raise RuntimeError(f"ffmpeg failed:\nCMD: {' '.join(cmd)}\nSTDERR:\n{e.stderr}") from e
+
+    if not video_path.exists():
+        raise OSError(f"Video encoding did not work. File not found: {video_path}.")
 
 def encode_video_frames(
     imgs_dir: Path | str,

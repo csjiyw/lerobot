@@ -93,13 +93,15 @@ def write_image(image: np.ndarray | PIL.Image.Image, fpath: Path, compress_level
         fails for any reason.
     """
     try:
-        if isinstance(image, np.ndarray):
-            img = image_array_to_pil_image(image)
-        elif isinstance(image, PIL.Image.Image):
-            img = image
-        else:
-            raise TypeError(f"Unsupported image type: {type(image)}")
-        img.save(fpath, compress_level=compress_level)
+        # if isinstance(image, np.ndarray):
+        #     img = image_array_to_pil_image(image)
+        # elif isinstance(image, PIL.Image.Image):
+        #     img = image
+        # else:
+        #     raise TypeError(f"Unsupported image type: {type(image)}")
+        # img.save(fpath, compress_level=compress_level)
+        with open(fpath, "wb") as f:
+            f.write(image.tobytes())
     except Exception as e:
         print(f"Error writing image {fpath}: {e}")
 

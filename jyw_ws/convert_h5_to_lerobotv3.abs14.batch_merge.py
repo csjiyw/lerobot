@@ -4,16 +4,16 @@
 
 
 
-W = 224
-H = 224
+W = 640
+H = 480
 raw_fps = 30
 step = 1
 fps = int(raw_fps / step)
 robot="agx"
-config = f"fps{fps}_cam3_w{W}h{H}_abs14_trim_tail_test"
-data_dir = "/workspace/data/rclone-v1.68.2-linux-amd64/data/537e9a6f62034a19aad056fe21b53fbb"
+config = f"fps{fps}_cam3_w{W}h{H}_abs14_trim_tail"
+data_dir = "/workspace/data/downloads/537e9a6f62034a19aad056fe21b53fbb"
 workers=16
-episodes_per_dataset=1
+episodes_per_dataset=5
 task_text = "fold the blue cloth towel neatly"
 
 task_name = robot+"_"+task_text.replace(" ","_")
@@ -387,24 +387,24 @@ def main():
     print(f"[DONE] merged into: {merged_repo_id}")
 
     # ===== cleanup intermediate group repos =====
-    # print("[CLEANUP] removing intermediate dataset repos...")
+    print("[CLEANUP] removing intermediate dataset repos...")
 
-    # for repo_id in repo_ids_to_merge:
-    #     repo_path = Path(HF_LEROBOT_HOME) / repo_id
-    #     if not repo_path.exists():
-    #         print(f"  [SKIP] not found: {repo_id}")
-    #         continue
+    for repo_id in repo_ids_to_merge:
+        repo_path = Path(HF_LEROBOT_HOME) / repo_id
+        if not repo_path.exists():
+            print(f"  [SKIP] not found: {repo_id}")
+            continue
 
-    #     # 双保险：只删当前任务前缀的 group repo
-    #     if not repo_id.startswith(f"{args.repo_id}_g"):
-    #         print(f"  [SKIP] unexpected repo name: {repo_id}")
-    #         continue
+        # 双保险：只删当前任务前缀的 group repo
+        if not repo_id.startswith(f"{args.repo_id}_g"):
+            print(f"  [SKIP] unexpected repo name: {repo_id}")
+            continue
 
-    #     import shutil
-    #     shutil.rmtree(repo_path)
-    #     print(f"  [DEL] {repo_id}")
+        import shutil
+        shutil.rmtree(repo_path)
+        print(f"  [DEL] {repo_id}")
 
-    # print("[CLEANUP DONE]")
+    print("[CLEANUP DONE]")
 
 if __name__ == "__main__":
     main()

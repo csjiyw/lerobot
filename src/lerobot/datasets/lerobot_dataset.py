@@ -70,7 +70,7 @@ from lerobot.datasets.video_utils import (
     VideoFrame,
     concatenate_video_files,
     decode_video_frames,
-    encode_video_frames2,
+    encode_video_frames3,
     get_safe_default_codec,
     get_video_duration_in_s,
     get_video_info,
@@ -545,9 +545,9 @@ def _encode_video_worker(
     video_key: str, episode_index: int, root: Path, fps: int, vcodec: str = "libsvtav1"
 ) -> Path:
     temp_path = Path(tempfile.mkdtemp(dir=root)) / f"{video_key}_{episode_index:03d}.mp4"
-    fpath = DEFAULT_IMAGE_PATH.format(image_key=video_key, episode_index=episode_index, frame_index=0)
+    fpath = DEFAULT_IMAGE_PATH.format(image_key=video_key, episode_index=episode_index, frame_index=0,ext="unknow")
     img_dir = (root / fpath).parent
-    statistics=encode_video_frames2(img_dir, temp_path, fps,
+    statistics=encode_video_frames3(img_dir, temp_path, fps,
                         # vcodec="h264_nvenc",
                         # g=None,          # NVENC 通常不需要你手动设 GOP
                         # crf=None,        # NVENC 不用 CRF overwrite=True
@@ -1114,9 +1114,10 @@ class LeRobotDataset(torch.utils.data.Dataset):
     # TODO(Steven): consider move this to utils
     def _get_image_file_path(self, episode_index: int, image_key: str, frame_index: int) -> Path:
         fpath = DEFAULT_IMAGE_PATH.format(
-            image_key=image_key, episode_index=episode_index, frame_index=frame_index
+            image_key=image_key, episode_index=episode_index, frame_index=frame_index,ext=self.img_format
         )
-        return self.root / fpath
+        # return self.root / fpath
+        return  self.root/ fpath
 
     def _get_image_file_dir(self, episode_index: int, image_key: str) -> Path:
         return self._get_image_file_path(episode_index, image_key, frame_index=0).parent
@@ -1125,16 +1126,16 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self, image: torch.Tensor | np.ndarray | PIL.Image.Image, fpath: Path, compress_level: int = 1
     ) -> None:
         
-        with open(fpath, "wb") as f:
-            f.write(image.tobytes())
-        return
+        # with open(fpath, "wb") as f:
+        #     f.write(image.tobytes())
+        # return
 
-        # if self.image_writer is None:
-        #     if isinstance(image, torch.Tensor):
-        #         image = image.cpu().numpy()
-        #     write_image(image, fpath, compress_level=compress_level)
-        # else:
-        #     self.image_writer.save_image(image=image, fpath=fpath, compress_level=compress_level)
+        if self.image_writer is None:
+            if isinstance(image, torch.Tensor):
+                image = image.cpu().numpy()
+            write_image(image, fpath, compress_level=compress_level)
+        else:
+            self.image_writer.save_image(image=image, fpath=fpath, compress_level=compress_level)
 
     def add_frame(self, frame: dict) -> None:
         """
@@ -1184,6 +1185,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self,
         episode_data: dict | None = None,
         parallel_encoding: bool = True,
+        logger=None
     ) -> None:
         """
         This will save to disk the current episode in self.episode_buffer.
@@ -1227,6 +1229,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         # Wait for image writer to end, so that episode stats over images can be computed
         self._wait_image_writer()
+        # logger.info(f"_wait_image_writer finish")
+
         ep_stats = compute_episode_stats(episode_buffer, self.features)
 
         ep_metadata = self._save_episode_data(episode_buffer)
@@ -1256,6 +1260,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
                         video_key = future_to_key[future]
                         # print("future",future.result())
                         # print("video_key",video_key)
+                        # logger.info(f"{video_key} finish")
                         try:
                             temp_path,statistics = future.result()
                             results[video_key] = temp_path
@@ -1275,6 +1280,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             else:
                 for video_key in self.meta.video_keys:
                     m,statistics=self._save_episode_video(video_key, episode_index)
+                    # logger.info(f"{video_key} finish")
                     ep_metadata.update(m)
                     ep_stats[video_key]["mean"][:] = statistics["mean"]/255.0
                     ep_stats[video_key]["std"][:] = statistics["std"]/255.0

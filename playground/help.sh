@@ -39,6 +39,49 @@ huawei-cloud:openloong-apps-prod-private/data-collector-svc/align/1da29204155f48
   ./data/${task_id}/${episode_id} \
   --progress --transfers 8 --checkers 16
 
+#a2 test
+./rclone copy \
+  huawei-cloud:openloong-apps-prod-private/data-collector-svc/align/0005423097a649979efd61b44d4f30de \
+  /mnt/fastdisk/tmp_download/0005423097a649979efd61b44d4f30de \
+  --progress 
+
+SVT_LOG=1 python a2_align2lerobot_v30.jpeg.py \
+--input /mnt/fastdisk/tmp_download/0005423097a649979efd61b44d4f30de   \
+--output /mnt/fastdisk/test/0005423097a649979efd61b44d4f30de  \
+--repo_id 0005423097a649979efd61b44d4f30de  \
+--task abc_is good  \
+--workers 1
+
+
+# leju 0cf84491fd82411da88490fe9944b131
+./rclone copy \
+  huawei-cloud:openloong-apps-prod-private/data-collector-svc/align/0cf84491fd82411da88490fe9944b131 \
+  /mnt/fastdisk/test/tmp_download/0cf84491fd82411da88490fe9944b131 \
+  --progress 
+
+python lejukuafu_align2lerobot_v30.jpeg.py \
+--input /mnt/fastdisk/test/tmp_download/0cf84491fd82411da88490fe9944b131   \
+--output /mnt/fastdisk/test/output/0cf84491fd82411da88490fe9944b131  \
+--repo_id 0cf84491fd82411da88490fe9944b131  \
+--task abc_is good  \
+--workers 1
+
+
+# xinghaitu r1 007d5765032c4823a894b438070c161d
+./rclone copy \
+  huawei-cloud:openloong-apps-prod-private/data-collector-svc/align/007d5765032c4823a894b438070c161d \
+  /mnt/fastdisk/test/tmp_download/007d5765032c4823a894b438070c161d \
+  --progress 
+
+
+python xinghaitu_r1_align2lerobot_v30.jpeg.py \
+--input /mnt/fastdisk/test/tmp_download/007d5765032c4823a894b438070c161d   \
+--output /mnt/fastdisk/test/output/007d5765032c4823a894b438070c161d  \
+--repo_id 007d5765032c4823a894b438070c161d  \
+--task abc_is good  \
+--workers 1
+
+
 fea69b9a6d0440ada940ac432da0c48c
 
 python ginie1_align2lerobot_v30.py \
@@ -81,6 +124,21 @@ SVT_LOG=1 python gr2_align2lerobot_v30.jpeg.py \
 
 
 HF_HOME=/mnt/sdc/hf_cache TMPDIR=/mnt/sdb/tmp  python download_and_process.3.gr2.py
+
+
+# remote folder
+openloong-bigmodel/lerobotV3_data/existing_data
+# local folder
+/mnt/sdc/output
+# how to update to remote
+./rclone copy \
+  --progress 
+
+
+./rclone copy \
+  /mnt/sdc/output \
+  huawei-cloud:openloong-bigmodel/lerobotV3_data/existing_data \
+  --progress
 
 
 

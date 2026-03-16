@@ -116,7 +116,7 @@ def build_full_dof_features_chw(metadata, h, w):
     joint_info = metadata["data_info"]["joint_info"]
     camera_info = metadata["data_info"]["camera_info"]
 
-    fps = int(round(metadata["time_align_info"]["fps"]))
+    fps = 30#int(round(metadata["time_align_info"]["fps"]))
 
     use_cameras = list(camera_info.keys())
 

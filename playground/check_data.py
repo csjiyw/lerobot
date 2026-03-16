@@ -1,15 +1,29 @@
+import json
+
 import pandas as pd
-cur_task="7ddd70cc8e6740fc8ca4b7a59577fe37"
-df = pd.read_parquet(f"/mnt/fastdisk/output/{cur_task}/data/chunk-000/file-000.parquet")
+cur_task="0044f0e441f35a7eaa39889dd41be09b"
+df = pd.read_parquet(f"/mnt/sdc/output/{cur_task}/data/chunk-000/file-000.parquet")
 
 print(df.head())
+
+
+with open(f"/mnt/sdc/output/{cur_task}/meta/info.json") as f:
+    info = json.load(f)
+
+print(info)
+
+with open(f"/mnt/sdc/output/{cur_task}/meta/info.json") as f:
+    info = json.load(f)
+
+print(info)
+
 
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from torch.utils.data import DataLoader
 
 # dataset path
-dataset = LeRobotDataset(f"/mnt/fastdisk/output/{cur_task}")
+dataset = LeRobotDataset(f"/mnt/sdc/output/{cur_task}")
 
 # dataloader
 loader = DataLoader(dataset, batch_size=1, shuffle=False)

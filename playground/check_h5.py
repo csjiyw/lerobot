@@ -1,4 +1,5 @@
-h5_path=f"/mnt/fastdisk/tmp_download/00b617187c0c4543bc8757786b215e38/006019a48172421ebe0b78fb7793e5fa/006019a48172421ebe0b78fb7793e5fa.h5"
+
+h5_path=f"/mnt/fastdisk/test/tmp_download/007d5765032c4823a894b438070c161d/002963dbdc264fba8426ce7885f47aa2/002963dbdc264fba8426ce7885f47aa2.h5"
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 

@@ -1,5 +1,4 @@
-data_home="data/rclone-v1.68.2-linux-amd64/data/9f22b6b23ed64ced8fc8074d454e5672"
-h5_path=f"/mnt/sdc/tmp_download/01a81bc5a7df4551a903bb4d342c6eb7/004844aa626341249f87fa95193e0f1e/004844aa626341249f87fa95193e0f1e.h5"
+h5_path=f"/mnt/fastdisk/tmp_download/00b617187c0c4543bc8757786b215e38/006019a48172421ebe0b78fb7793e5fa/006019a48172421ebe0b78fb7793e5fa.h5"
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 

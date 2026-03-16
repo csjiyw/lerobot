@@ -81,3 +81,35 @@ SVT_LOG=1 python gr2_align2lerobot_v30.jpeg.py \
 
 
 HF_HOME=/mnt/sdc/hf_cache TMPDIR=/mnt/sdb/tmp  python download_and_process.3.gr2.py
+
+
+
+7ddd70cc8e6740fc8ca4b7a59577fe37
+
+python a2_align2lerobot_v30.jpeg.py \
+--input /mnt/fastdisk/tmp_download/7ddd70cc8e6740fc8ca4b7a59577fe37   \
+--output /mnt/fastdisk/test/7ddd70cc8e6740fc8ca4b7a59577fe37  \
+--repo_id 7ddd70cc8e6740fc8ca4b7a59577fe37  \
+--task abc_is good  \
+--workers 1
+
+
+./rclone copy \
+  /mnt/fastdisk/output \
+  huawei-cloud:openloong-bigmodel/lerobotV3_data/existing_data \
+  --progress
+
+qinglong
+00b617187c0c4543bc8757786b215e38
+./rclone copy \
+  huawei-cloud:openloong-apps-prod-private/data-collector-svc/align/00b617187c0c4543bc8757786b215e38 \
+  /mnt/fastdisk/tmp_download/00b617187c0c4543bc8757786b215e38 \
+  --progress
+
+
+python qinglongros1_align2lerobot_v30.jpeg.py \
+--input /mnt/fastdisk/tmp_download/00b617187c0c4543bc8757786b215e38   \
+--output /mnt/fastdisk/test/00b617187c0c4543bc8757786b215e38  \
+--repo_id 00b617187c0c4543bc8757786b215e38  \
+--task abc_is good  \
+--workers 1

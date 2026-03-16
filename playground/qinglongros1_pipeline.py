@@ -5,10 +5,10 @@ from openpyxl import load_workbook
 
 XLSX_IN = "task_and_description_checked.xlsx"
 DOWNLOAD_LIST_TXT = "download_list.txt"
-OUTPUT_TXT = "gr2_filtered_download_list.txt"
+OUTPUT_TXT = "qinglongros1_filtered_download_list.txt"
 
 # 你要的 robot type（按需改成你的值；可多个）
-ROBOT_TYPES = {"傅利叶GR2"}  # 例子：把这里换成你表里 D 列的实际内容
+ROBOT_TYPES = {"青龙"}  # 例子：把这里换成你表里 D 列的实际内容
 
 # ---- 1) 从 download_list 建立：data_id -> lines 映射 ----
 # 兼容 data_id 是 32位 hex：.../<data_id>/<episode>/...

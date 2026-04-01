@@ -485,7 +485,7 @@ def convert_dataset(
     chunks_size = info.get("chunks_size", DEFAULT_CHUNK_SIZE)
 
     backup_root = root.parent / f"{root.name}_{V30}"
-    new_root = Path("/mnt/sdc/v21") / f"{root.name}"
+    new_root = Path("/mnt/fastdisk/v21") / f"{root.name}"
 
     if backup_root.is_dir():
         shutil.rmtree(backup_root)

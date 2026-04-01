@@ -172,6 +172,92 @@ python qinglongros1_align2lerobot_v30.jpeg.py \
 --task abc_is good  \
 --workers 1
 
+python cvt_30_to_21.py --repo-id 0005423097a649979efd61b44d4f30de --root /mnt/fastdisk/output
+
+
+
+
+./rclone copy \
+  /mnt/fastdisk/v21 \
+  huawei-cloud:openloong-bigmodel/lerobotv21/existing_data \
+  --progress
+
+
+./rclone mount \
+huawei-cloud:openloong-bigmodel/lerobotv21/existing_data \
+data \
+--daemon
+
+
+# check this on huawei cloud
+./rclone lsf \
+  huawei-cloud:openloong-apps-prod-private/data-collector-svc/align/7fdc9a1d008c4aa186a997485d198cec
+
+./rclone copy \
+  huawei-cloud:openloong-apps-prod-private/data-collector-svc/align/7fdc9a1d008c4aa186a997485d198cec \
+  /mnt/fastdisk/tmp_download/7fdc9a1d008c4aa186a997485d198cec \
+  --progress
+
+
+find /mnt/fastdisk/output -maxdepth 1 -mindepth 1 -type d -printf '%f\n' \
+| tqdm --total "$(find /mnt/fastdisk/output -maxdepth 1 -mindepth 1 -type d | wc -l)" --unit repo \
+| xargs -I{} -P 16 bash -c '
+    echo "[START] {}"
+    python cvt_30_to_21.py --repo-id "{}" --root /mnt/fastdisk/output
+  '
+
+
+
+python convert_lerobot_v30.AstribotS1.jpeg.py \
+--input /mnt/fastdisk/tmp_download/7fdc9a1d008c4aa186a997485d198cec   \
+--output /mnt/fastdisk/test/7fdc9a1d008c4aa186a997485d198cec  \
+--repo_id 7fdc9a1d008c4aa186a997485d198cec  \
+--task abc_is good  \
+--workers 1
+
+python cvt_30_to_21.py --repo-id 0005423097a649979efd61b44d4f30de --root /mnt/fastdisk/output
+
+
+
+
+./rclone copy \
+  /mnt/fastdisk/v21 \
+  huawei-cloud:openloong-bigmodel/lerobotv21/existing_data \
+  --progress
+
+
+./rclone mount \
+huawei-cloud:openloong-bigmodel/lerobotv21/existing_data \
+data \
+--daemon
+
+
+# check this on huawei cloud
+./rclone lsf \
+  huawei-cloud:openloong-apps-prod-private/data-collector-svc/align/7fdc9a1d008c4aa186a997485d198cec
+
+./rclone copy \
+  huawei-cloud:openloong-apps-prod-private/data-collector-svc/align/7fdc9a1d008c4aa186a997485d198cec \
+  /mnt/fastdisk/tmp_download/7fdc9a1d008c4aa186a997485d198cec \
+  --progress
+
+
+find /mnt/fastdisk/output -maxdepth 1 -mindepth 1 -type d -printf '%f\n' \
+| tqdm --total "$(find /mnt/fastdisk/output -maxdepth 1 -mindepth 1 -type d | wc -l)" --unit repo \
+| xargs -I{} -P 16 bash -c '
+    echo "[START] {}"
+    python cvt_30_to_21.py --repo-id "{}" --root /mnt/fastdisk/output
+  '
+
+
+
+python convert_lerobot_v30.AstribotS1.jpeg.py \
+--input /mnt/fastdisk/tmp_download/7fdc9a1d008c4aa186a997485d198cec   \
+--output /mnt/fastdisk/test/7fdc9a1d008c4aa186a997485d198cec  \
+--repo_id 7fdc9a1d008c4aa186a997485d198cec  \
+--task abc_is good  \
+--workers 1
+
 
 
 ./rclone copy \

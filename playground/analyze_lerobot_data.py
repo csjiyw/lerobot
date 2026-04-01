@@ -334,7 +334,7 @@ def main():
     )
     
     parser.add_argument("data_dir", type=Path, nargs='?',
-                        default=Path("/mnt/sdc/output"),
+                        default=Path("/mnt/fastdisk/output"),
                         help="LeRobot 数据集根目录")
     parser.add_argument("--output", "-o", type=Path, default="stats.txt",
                         help="统计报告输出文件路径（txt格式）")

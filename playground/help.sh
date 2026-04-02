@@ -171,3 +171,49 @@ python qinglongros1_align2lerobot_v30.jpeg.py \
 --repo_id 00b617187c0c4543bc8757786b215e38  \
 --task abc_is good  \
 --workers 1
+
+
+
+./rclone copy \
+  /mnt/sdc/v21 \
+  huawei-cloud:openloong-bigmodel/lerobotv21/existing_data \
+  --progress
+
+
+
+./rclone copy \
+  huawei-cloud:openloong-apps-prod-private/data-collector-svc/align/b6104a919ef14249966311b1ff8cd5a5 \
+  /mnt/fastdisk/tmp_download/b6104a919ef14249966311b1ff8cd5a5 \
+  --progress
+
+python fr3_align2lerobot_v30.jpeg.py \
+--input /mnt/fastdisk/tmp_download/b6104a919ef14249966311b1ff8cd5a5   \
+--output /mnt/fastdisk/test/b6104a919ef14249966311b1ff8cd5a5  \
+--repo_id b6104a919ef14249966311b1ff8cd5a5  \
+--task abc_is good  \
+--workers 1
+
+
+# aloha
+73b116159fb24a2ca441ce26c1bc3b20
+
+
+./rclone copy \
+  huawei-cloud:openloong-apps-prod-private/data-collector-svc/align/73b116159fb24a2ca441ce26c1bc3b20 \
+  /mnt/fastdisk/tmp_download/73b116159fb24a2ca441ce26c1bc3b20 \
+  --progress
+
+python cobotmagic_align2lerobot_v30.jpeg.py \
+--input /mnt/fastdisk/tmp_download/73b116159fb24a2ca441ce26c1bc3b20   \
+--output /mnt/fastdisk/test/73b116159fb24a2ca441ce26c1bc3b20  \
+--repo_id 73b116159fb24a2ca441ce26c1bc3b20  \
+--task abc_is good  \
+--workers 1
+
+
+find /mnt/sdc/output -maxdepth 1 -mindepth 1 -type d -printf '%f\n' \
+| tqdm --total "$(find /mnt/sdc/output -maxdepth 1 -mindepth 1 -type d | wc -l)" --unit repo \
+| xargs -I{} -P 16 bash -c '
+    echo "[START] {}"
+    python cvt_30_to_21.py --repo-id "{}" --root /mnt/sdc/output
+'

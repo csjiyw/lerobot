@@ -184,32 +184,43 @@ def build_full_dof_features_chw(metadata, h, w):
     return features
 
 
-def load_a2d_h5(h5_path: Path) -> Dict[str, Any]:
-    """
-    从 A2D H5 文件加载数据
+
+
+def detect_img_ext(arr):
+    x = arr.tobytes() if hasattr(arr, "tobytes") else bytes(arr)
+    if x.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if x.startswith(b"\xff\xd8\xff"):
+        return "jpg"
+    raise ValueError("unknown image format")
+
+# =============================================================================
+# Episode 转换
+# =============================================================================
+
+def convert_episode(
+    h5_path,
+    output_dir: Path,
+    repo_id: str,
+    episode_index: int,
+    fps: int,
+    vcodec: str = "libsvtav1",
+    crf: int = 30,
+    task_override: str = None,
+    dataset=None,
+) -> dict:
+    """将单个 episode 数据转换为 LeRobot 数据集格式"""
+
     
-    Returns:
-        {
-            'frames': int,
-            'state': np.ndarray,  # (N, 16) = arm(14) + effector(2)
-            'action': np.ndarray, # (N, 16) = arm(14) + effector(2)
-            'images': {
-                'camera_id': List[np.ndarray],
-                ...
-            },
-            'task': str,
-            'image_shapes': dict,
-        }
-    """
-    data = {}
-    
+    episode_data = {}
+
     with h5py.File(h5_path, 'r') as f:
         # 读取 metadata
         metadata = json.loads(f['metadata.json'][()])
 
-        data['task'] = metadata.get('task_name', 'manipulation_task')
+        episode_data['task'] = metadata.get('task_name', 'manipulation_task')
         n=metadata["time_align_info"]["frame_count"]
-        data['frames'] = n
+        episode_data['frames'] = n
 
         # 时间戳
         timestamps = f['timestamp'][:n]
@@ -229,12 +240,12 @@ def load_a2d_h5(h5_path: Path) -> Dict[str, Any]:
         action_waist = f["joints/action/waist/position"][()]
 
         # concatenate first
-        data['state'] = np.concatenate(
+        episode_data['state'] = np.concatenate(
             [state_arm, state_effector, state_head, state_leg, state_waist],
             axis=1,
         ).astype(np.float32)   # (T, 41)
 
-        data['action'] = np.concatenate(
+        episode_data['action'] = np.concatenate(
             [action_arm, action_effector, action_head, action_leg, action_waist],
             axis=1,
         ).astype(np.float32)   # (T, 41)
@@ -245,16 +256,16 @@ def load_a2d_h5(h5_path: Path) -> Dict[str, Any]:
         
         target_width, target_height = ROBOT_CONFIG["target_image_size"]
 
-        data["features"]=build_full_dof_features_chw(metadata,target_height,target_width)
+        episode_data["features"]=build_full_dof_features_chw(metadata,target_height,target_width)
 
  
         
         for cam_id in ROBOT_CONFIG["cameras"]:
             cam_key = f'cameras/{cam_id}/color/data'
             if cam_key in f:
-                img_bytes_array = f[cam_key][:n]
+                # img_bytes_array = f[cam_key][:n]
 
-                images[cam_id] = img_bytes_array  # (N, C, H, W)
+                images[cam_id] =cam_key # img_bytes_array  # (N, C, H, W)
                 # print(img_tensor.dtype,img_tensor.shape)
                 image_shapes[cam_id] = (1,target_height,target_width,3)
             
@@ -262,48 +273,8 @@ def load_a2d_h5(h5_path: Path) -> Dict[str, Any]:
             else:
                 raise ValueError("cam_key is invalid")
         
-        data['images'] = images
-        data['image_shapes'] = image_shapes
-
-        # print("image_shapes",image_shapes)
-        # for k in data.keys():
-        #     # data[k]=np.array(data[k])
-        #     try:
-        #         print(k,data[k].shape)
-        #     except Exception as e:
-        #         print(k)
-        # exit()
-
-    
-    return data
-
-def detect_img_ext(arr):
-    x = arr.tobytes() if hasattr(arr, "tobytes") else bytes(arr)
-    if x.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "png"
-    if x.startswith(b"\xff\xd8\xff"):
-        return "jpg"
-    raise ValueError("unknown image format")
-
-# =============================================================================
-# Episode 转换
-# =============================================================================
-
-def convert_episode(
-    episode_data: Dict[str, Any],
-    output_dir: Path,
-    repo_id: str,
-    episode_index: int,
-    fps: int,
-    vcodec: str = "libsvtav1",
-    crf: int = 30,
-    task_override: str = None,
-    dataset=None,
-) -> dict:
-    """将单个 episode 数据转换为 LeRobot 数据集格式"""
-
-    
-    if True:
+        episode_data['images'] = images
+        episode_data['image_shapes'] = image_shapes
         # print("------------------")
         # print(episode_data)
         # exit()
@@ -333,7 +304,7 @@ def convert_episode(
                 fps=fps,
                 features=episode_data["features"],
                 use_videos=True,
-                image_writer_threads=4,
+                image_writer_threads=3,
                 image_writer_processes=2
             )
 
@@ -343,7 +314,7 @@ def convert_episode(
         # logger.info(f"Adding {num_frames} frames...")
 
 
-        
+
         for i in range(num_frames):
             frame_dict = {
                 "observation.state": episode_data['state'][i],
@@ -362,12 +333,17 @@ def convert_episode(
 
                 #     DEFAULT_IMAGE_PATH # "images/{image_key}/episode-{episode_index:06d}/frame-{frame_index:06d}.jpg"
                 #     os._exit(0)
-                img_arr=to_numpy(episode_data['images'][cam_id][i])
+                # img_arr=to_numpy(episode_data['images'][cam_id][i])
+                cam_key = episode_data["images"][cam_id]
+                img_arr = to_numpy(f[cam_key][i])
                 if i==0:
                     dataset.img_format=detect_img_ext(img_arr)
-                frame_dict[f"observation.images.{cam_id}"] = to_numpy(episode_data['images'][cam_id][i])
+                frame_dict[f"observation.images.{cam_id}"] = img_arr
                     
             dataset.add_frame(frame_dict)
+
+            if i % 500 == 0 and i > 0:
+                dataset.image_writer.wait_until_done()
         
         # logger.info(f"Adding {num_frames} frames... finish")
 
@@ -403,10 +379,10 @@ def convert_episode_wrapper(args: tuple) -> dict:
         dataset=None
         for h5_path in h5_paths:
             # logger.info(f"load h5 {h5_path} ...")
-            episode_data = load_a2d_h5(h5_path)
+            # episode_data = load_a2d_h5(h5_path)
             # logger.info(f"cvt task ...")
             dataset= convert_episode(
-                episode_data=episode_data,
+                h5_path,
                 output_dir=output_dir,
                 repo_id=repo_id,
                 episode_index=episode_index,
@@ -515,7 +491,7 @@ def main():
     # 构建任务
     tasks = []
 
-    batch_size = 4
+    batch_size = 1
     for i in range(0, len(episodes), batch_size):
         batch_eps = episodes[i:i + batch_size]
 

@@ -62,8 +62,8 @@ def download_task(task_id: str, local_task_dir: str, workers: int):
         RCLONE_BIN, "copy",
         remote_task_root,
         local_task_dir,
-        "--transfers", str(workers),
-        "--progress"
+        # "--transfers", str(workers),
+        # "--progress"
     ]
     run(cmd, check=True)
 

@@ -1,0 +1,26 @@
+{
+    "robot_type": "fr3",
+    "target_image_size": [640, 480],
+    "hardcoded_names":{
+        "end_position":["left_x","left_y","left_z","right_x","right_y","right_z"],
+        "end_orientation":[ "left_qx", "left_qy", "left_qz", "left_qw", "right_qx", "right_qy", "right_qz", "right_qw"]
+    },
+    "state_joints": {
+        "order": ["arm", "effector","end_position","end_orientation"],
+        "paths": {
+            "arm": "joints/state/arm/position",
+            "effector": "joints/state/effector/position",
+            "end_position": "joints/state/end/position",
+            "end_orientation": "joints/state/end/orientation"
+        }
+    },
+    "action_joints": {
+        "order": ["arm", "effector","end_position","end_orientation"],
+        "paths": {
+            "arm": "joints/action/arm/position",
+            "effector": "joints/action/effector/position",
+            "end_position": "joints/action/end/position",
+            "end_orientation": "joints/action/end/orientation"
+        }
+    }
+}

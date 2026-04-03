@@ -1,0 +1,22 @@
+{
+    "robot_type": "lejukuafu",
+    "target_image_size": [640, 480],
+    "state_joints": {
+        "order": ["arm", "effector", "head", "leg"],
+        "paths": {
+            "arm": "joints/state/arm/position",
+            "effector": "joints/state/effector/position",
+            "head": "joints/state/head/position",
+            "leg": "joints/state/leg/position"
+        }
+    },
+    "action_joints": {
+        "order": ["arm", "effector", "head", "leg"],
+        "paths": {
+            "arm": "joints/action/arm/position",
+            "effector": "joints/action/effector/position",
+            "head": "joints/action/head/position",
+            "leg": "joints/action/leg/position"
+        }
+    }
+}

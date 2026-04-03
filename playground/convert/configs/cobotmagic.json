@@ -1,0 +1,26 @@
+{
+    "robot_type": "cobotmagic",
+    "target_image_size": [640, 480],
+    "state_joints": {
+        "order": ["arm", "effector", "robot_angular", "robot_velocity"],
+        "paths": {
+            "arm": "joints/state/arm/position",
+            "effector": "joints/state/effector/position",
+            "robot_angular": "joints/state/robot/angular",
+            "robot_velocity": "joints/state/robot/velocity"
+        }
+    },
+    "action_joints": {
+        "order": ["arm", "effector", "robot_angular", "robot_velocity"],
+        "paths": {
+            "arm": "joints/action/arm/position",
+            "effector": "joints/action/effector/position",
+            "robot_angular": "joints/action/robot/angular",
+            "robot_velocity": "joints/action/robot/velocity"
+        }
+    },
+    "hardcoded_names": {
+        "robot_angular": ["robot_angular_x", "robot_angular_y", "robot_angular_z"],
+        "robot_velocity": ["robot_vel_x", "robot_vel_y", "robot_vel_z"]
+    }
+}

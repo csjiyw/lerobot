@@ -1,0 +1,28 @@
+{
+    "robot_type": "AstribotS1",
+    "target_image_size": [640, 480],
+    "state_joints": {
+        "order": ["arm", "effector", "head", "torso", "chassis"],
+        "paths": {
+            "arm": "joints/state/arm/position",
+            "effector": "joints/state/effector/position",
+            "head": "joints/state/head/position",
+            "torso": "joints/state/torso/position",
+            "chassis": "joints/state/chassis/position"
+        }
+    },
+    "action_joints": {
+        "order": ["arm", "effector", "head", "torso", "chassis"],
+        "paths": {
+            "arm": "joints/action/arm/position",
+            "effector": "joints/action/effector/position",
+            "head": "joints/action/head/position",
+            "torso": "joints/action/torso/position",
+            "chassis": "joints/action/chassis/position"
+        }
+    },
+    "camera_filter": {
+        "include_patterns": ["head", "hand_", "torso"],
+        "description": "Only include head, hand_*, and torso cameras"
+    }
+}

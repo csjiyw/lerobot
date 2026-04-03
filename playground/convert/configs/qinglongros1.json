@@ -1,0 +1,18 @@
+{
+    "robot_type": "QinLongROS1",
+    "target_image_size": [640, 480],
+    "state_joints": {
+        "order": ["arm", "effector"],
+        "paths": {
+            "arm": "joints/state/arm/position",
+            "effector": "joints/state/effector/position"
+        }
+    },
+    "action_joints": {
+        "order": ["arm", "effector"],
+        "paths": {
+            "arm": "joints/action/arm/position",
+            "effector": "joints/action/effector/position"
+        }
+    }
+}

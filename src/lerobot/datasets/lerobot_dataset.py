@@ -721,6 +721,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.episodes_since_last_encoding = 0
         self.vcodec = resolve_vcodec(vcodec)
         self._encoder_threads = encoder_threads
+        self.img_format="png"
 
         # Unused attributes
         self.image_writer = None

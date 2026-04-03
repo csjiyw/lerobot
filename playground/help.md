@@ -189,6 +189,18 @@ data \
 --daemon
 
 
+# astribot s1 ok
+```sh
+7fdc9a1d008c4aa186a997485d198cec
+
+python convert/base_converter.py --robot astribot_s1 \
+    --input /mnt/fastdisk/tmp_download/7fdc9a1d008c4aa186a997485d198cec  \
+    --output /mnt/fastdisk/test/7fdc9a1d008c4aa186a997485d198cec \
+    --workers 1
+
+
+
+
 # check this on huawei cloud
 ./rclone lsf \
   huawei-cloud:openloong-apps-prod-private/data-collector-svc/align/7fdc9a1d008c4aa186a997485d198cec
@@ -199,14 +211,6 @@ data \
   --progress
 
 
-find /mnt/fastdisk/output -maxdepth 1 -mindepth 1 -type d -printf '%f\n' \
-| tqdm --total "$(find /mnt/fastdisk/output -maxdepth 1 -mindepth 1 -type d | wc -l)" --unit repo \
-| xargs -I{} -P 16 bash -c '
-    echo "[START] {}"
-    python cvt_30_to_21.py --repo-id "{}" --root /mnt/fastdisk/output
-  '
-
-
 
 python convert_lerobot_v30.AstribotS1.jpeg.py \
 --input /mnt/fastdisk/tmp_download/7fdc9a1d008c4aa186a997485d198cec   \
@@ -214,6 +218,66 @@ python convert_lerobot_v30.AstribotS1.jpeg.py \
 --repo_id 7fdc9a1d008c4aa186a997485d198cec  \
 --task abc_is good  \
 --workers 1
+
+
+```
+
+
+# fr3 ok
+```bash
+
+b6104a919ef14249966311b1ff8cd5a5
+
+./rclone copy \
+  huawei-cloud:openloong-apps-prod-private/data-collector-svc/align/b6104a919ef14249966311b1ff8cd5a5 \
+  /mnt/fastdisk/tmp_download/b6104a919ef14249966311b1ff8cd5a5 \
+  --progress
+
+python fr3_align2lerobot_v30.jpeg.py \
+  --input /mnt/fastdisk/tmp_download/b6104a919ef14249966311b1ff8cd5a5   \
+  --output /mnt/fastdisk/test/b6104a919ef14249966311b1ff8cd5a5  \
+  --repo_id b6104a919ef14249966311b1ff8cd5a5  \
+  --task abc_is good  \
+  --workers 1
+
+
+python convert/base_converter.py \
+  --robot fr3  \
+  --input /mnt/fastdisk/tmp_download/b6104a919ef14249966311b1ff8cd5a5  \
+  --output /mnt/fastdisk/test/b6104a919ef14249966311b1ff8cd5a5 \
+  --workers 1
+
+
+```
+
+# cobot magic aloha ok
+```bash
+73b116159fb24a2ca441ce26c1bc3b20
+
+
+./rclone copy \
+  huawei-cloud:openloong-apps-prod-private/data-collector-svc/align/73b116159fb24a2ca441ce26c1bc3b20 \
+  /mnt/fastdisk/tmp_download/73b116159fb24a2ca441ce26c1bc3b20 \
+  --progress
+
+python cobotmagic_align2lerobot_v30.jpeg.py \
+--input /mnt/fastdisk/tmp_download/73b116159fb24a2ca441ce26c1bc3b20   \
+--output /mnt/fastdisk/test/73b116159fb24a2ca441ce26c1bc3b20  \
+--repo_id 73b116159fb24a2ca441ce26c1bc3b20  \
+--task abc_is good  \
+--workers 1
+
+python convert/base_converter.py --robot cobotmagic \
+    --input /mnt/fastdisk/tmp_download/73b116159fb24a2ca441ce26c1bc3b20  \
+    --output /mnt/fastdisk/test/73b116159fb24a2ca441ce26c1bc3b20 \
+    --workers 1
+
+```
+
+
+
+# 30 to 21
+```bash
 
 python cvt_30_to_21.py --repo-id 0005423097a649979efd61b44d4f30de --root /mnt/fastdisk/output
 
@@ -232,74 +296,10 @@ data \
 --daemon
 
 
-# check this on huawei cloud
-./rclone lsf \
-  huawei-cloud:openloong-apps-prod-private/data-collector-svc/align/7fdc9a1d008c4aa186a997485d198cec
-
-./rclone copy \
-  huawei-cloud:openloong-apps-prod-private/data-collector-svc/align/7fdc9a1d008c4aa186a997485d198cec \
-  /mnt/fastdisk/tmp_download/7fdc9a1d008c4aa186a997485d198cec \
-  --progress
-
-
-find /mnt/fastdisk/output -maxdepth 1 -mindepth 1 -type d -printf '%f\n' \
-| tqdm --total "$(find /mnt/fastdisk/output -maxdepth 1 -mindepth 1 -type d | wc -l)" --unit repo \
-| xargs -I{} -P 16 bash -c '
-    echo "[START] {}"
-    python cvt_30_to_21.py --repo-id "{}" --root /mnt/fastdisk/output
-  '
-
-
-
-python convert_lerobot_v30.AstribotS1.jpeg.py \
---input /mnt/fastdisk/tmp_download/7fdc9a1d008c4aa186a997485d198cec   \
---output /mnt/fastdisk/test/7fdc9a1d008c4aa186a997485d198cec  \
---repo_id 7fdc9a1d008c4aa186a997485d198cec  \
---task abc_is good  \
---workers 1
-
-
-
-./rclone copy \
-  /mnt/sdc/v21 \
-  huawei-cloud:openloong-bigmodel/lerobotv21/existing_data \
-  --progress
-
-
-
-./rclone copy \
-  huawei-cloud:openloong-apps-prod-private/data-collector-svc/align/b6104a919ef14249966311b1ff8cd5a5 \
-  /mnt/fastdisk/tmp_download/b6104a919ef14249966311b1ff8cd5a5 \
-  --progress
-
-python fr3_align2lerobot_v30.jpeg.py \
---input /mnt/fastdisk/tmp_download/b6104a919ef14249966311b1ff8cd5a5   \
---output /mnt/fastdisk/test/b6104a919ef14249966311b1ff8cd5a5  \
---repo_id b6104a919ef14249966311b1ff8cd5a5  \
---task abc_is good  \
---workers 1
-
-
-# aloha
-73b116159fb24a2ca441ce26c1bc3b20
-
-
-./rclone copy \
-  huawei-cloud:openloong-apps-prod-private/data-collector-svc/align/73b116159fb24a2ca441ce26c1bc3b20 \
-  /mnt/fastdisk/tmp_download/73b116159fb24a2ca441ce26c1bc3b20 \
-  --progress
-
-python cobotmagic_align2lerobot_v30.jpeg.py \
---input /mnt/fastdisk/tmp_download/73b116159fb24a2ca441ce26c1bc3b20   \
---output /mnt/fastdisk/test/73b116159fb24a2ca441ce26c1bc3b20  \
---repo_id 73b116159fb24a2ca441ce26c1bc3b20  \
---task abc_is good  \
---workers 1
-
-
 find /mnt/sdc/output -maxdepth 1 -mindepth 1 -type d -printf '%f\n' \
 | tqdm --total "$(find /mnt/sdc/output -maxdepth 1 -mindepth 1 -type d | wc -l)" --unit repo \
 | xargs -I{} -P 16 bash -c '
     echo "[START] {}"
     python cvt_30_to_21.py --repo-id "{}" --root /mnt/sdc/output
 '
+```

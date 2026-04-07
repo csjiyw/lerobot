@@ -1,0 +1,17 @@
+name: Gemma Config
+version: 1.0.0
+schema: v1
+
+# Define which models can be used
+# https://docs.continue.dev/customization/models
+models:
+  - name: Gemma Local
+    provider: openai
+    model: google/gemma-4-31B-it
+    apiBase: http://172.16.128.4:7999/v1
+    apiKey: dummy
+    roles:
+      - chat
+      - edit
+    capabilities:
+      - tool_use

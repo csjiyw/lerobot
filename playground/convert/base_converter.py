@@ -259,7 +259,7 @@ def convert_episode(
         # Build features
         target_width, target_height = robot_config["target_image_size"]
         features, use_cameras = build_features(metadata, target_height, target_width, robot_config)
-        print(json.dumps(features, indent=2))
+        # print(json.dumps(features, indent=2))
         # Create dataset if first episode
         if dataset is None:
             episode_dir = output_dir / f"episode_{episode_index:04d}"
@@ -342,13 +342,13 @@ def convert_episode(
 
         
         
-        print(f"State shape  : {state.shape}")
-        print(f"Action shape : {action.shape}")
-        print(f"Task         : {task}")
+        # print(f"State shape  : {state.shape}")
+        # print(f"Action shape : {action.shape}")
+        # print(f"Task         : {task}")
  
 
         # Add frames
-        for i in trange(0,end_index):
+        for i in range(0,end_index):
             frame_dict = {
                 "observation.state": state[i],
                 "action": action[i],
@@ -360,7 +360,7 @@ def convert_episode(
                 img_arr = to_numpy(f[cam_key][i])
 
                 # disable to accelerate img write speed which need modify lerobot code
-                img_arr=imgbyte2rgb_hwc(img_arr,target_width,target_height)
+                # img_arr=imgbyte2rgb_hwc(img_arr,target_width,target_height)
 
                 if i == 0:
                     dataset.img_format = detect_img_ext(img_arr)
@@ -477,7 +477,7 @@ def main():
     robot_config = get_robot_config(args.robot)
 
     # Find episodes
-    episodes = find_episodes(args.input)[:1]
+    episodes = find_episodes(args.input)#[:1]
     if not episodes:
         print(f"No .h5 files found in {args.input}")
         sys.exit(1)
@@ -552,50 +552,17 @@ def main():
         print("\nMerging into final dataset...")
         
         # Incremental merge: merge in batches to reduce memory
-        if len(success_datasets) > 10:
-            logger.info(f"Merging {len(success_datasets)} datasets incrementally...")
-            merged_so_far = None
-            merge_batch_size = 10
-            
-            for i in range(0, len(success_datasets), merge_batch_size):
-                batch = success_datasets[i:i + merge_batch_size]
-                batch_datasets = [LeRobotDataset(root=dpath, repo_id=dpath.name) for dpath in batch]
-                
-                if merged_so_far is None:
-                    merged_so_far = merge_datasets(
-                        datasets=batch_datasets,
-                        output_dir=output_root,
-                        output_repo_id=args.repo_id,
-                    )
-                else:
-                    # Merge with existing
-                    batch_datasets.insert(0, merged_so_far)
-                    merged_so_far = merge_datasets(
-                        datasets=batch_datasets,
-                        output_dir=output_root,
-                        output_repo_id=args.repo_id,
-                    )
-                
-                logger.info(f"Merged batch {i // merge_batch_size + 1}, total episodes: {merged_so_far.meta.total_episodes}")
-                
-                # Clean up intermediate datasets
-                for ds in batch_datasets[1:]:
-                    del ds
-                gc.collect()
-            
-            merged = merged_so_far
-        else:
-            # Direct merge for small number of datasets
-            datasets_to_merge = []
-            for dpath in sorted(success_datasets):
-                ds = LeRobotDataset(root=dpath, repo_id=dpath.name)
-                datasets_to_merge.append(ds)
-            
-            merged = merge_datasets(
-                datasets=datasets_to_merge,
-                output_dir=output_root,
-                output_repo_id=args.repo_id,
-            )
+        # Direct merge for small number of datasets
+        datasets_to_merge = []
+        for dpath in sorted(success_datasets):
+            ds = LeRobotDataset(root=dpath, repo_id=dpath.name)
+            datasets_to_merge.append(ds)
+        
+        merged = merge_datasets(
+            datasets=datasets_to_merge,
+            output_dir=output_root,
+            output_repo_id=args.repo_id,
+        )
 
         print("\nMerge Complete!")
         print(f"Output: {output_root}")

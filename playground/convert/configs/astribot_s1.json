@@ -24,5 +24,17 @@
     "camera_filter": {
         "include_patterns": ["head", "hand_", "torso"],
         "description": "Only include head, hand_*, and torso cameras"
+    },
+    "hardcoded_names": {
+        "arm": [
+            "l_shoulder_pitch", "l_shoulder_roll", "l_shoulder_yaw",
+            "l_elbow_pitch", "l_wrist_yaw", "l_wrist_pitch", "l_wrist_roll",
+            "r_shoulder_pitch", "r_shoulder_roll", "r_shoulder_yaw",
+            "r_elbow_pitch", "r_wrist_yaw", "r_wrist_pitch", "r_wrist_roll"
+        ],
+        "effector": ["left_claw", "right_claw"],
+        "head": ["head_pan", "head_tilt"],
+        "torso": ["ankle_pitch", "knee_pitch", "hip_pitch", "hip_yaw"],
+        "chassis": ["chassis_x*", "chassis_y*", "chassis_yaw*"]
     }
 }

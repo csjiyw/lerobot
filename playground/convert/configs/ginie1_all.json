@@ -18,13 +18,12 @@
         }
     },
     "action_joints": {
-        "order": ["waist", "arm", "effector", "head", "position", "velocity"],
+        "order": ["waist", "arm", "effector", "head", "velocity"],
         "paths": {
             "waist": "joints/action/waist/position",
             "arm": "joints/action/arm/position",
             "effector": "joints/action/effector/position",
             "head": "joints/action/head/position",
-            "position": "joints/action/robot/position",
             "velocity": "joints/action/robot/velocity"
         }
     }

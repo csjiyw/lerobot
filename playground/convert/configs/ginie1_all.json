@@ -1,0 +1,31 @@
+{
+    "robot_type": "Genie1",
+    "target_image_size": [640, 480],
+    "hardcoded_names":{
+        "position":["x","y","z"],
+        "orientation":[ "qx", "qy", "qz", "qw"],
+        "velocity":[ "v","w"]
+    },
+    "state_joints": {
+        "order": ["waist", "arm", "effector", "head", "position", "orientation"],
+        "paths": {
+            "waist": "joints/state/waist/position",
+            "arm": "joints/state/arm/position",
+            "effector": "joints/state/effector/position",
+            "head": "joints/state/head/position",
+            "position": "joints/state/robot/position",
+            "orientation": "joints/state/robot/orientation"
+        }
+    },
+    "action_joints": {
+        "order": ["waist", "arm", "effector", "head", "position", "velocity"],
+        "paths": {
+            "waist": "joints/action/waist/position",
+            "arm": "joints/action/arm/position",
+            "effector": "joints/action/effector/position",
+            "head": "joints/action/head/position",
+            "position": "joints/action/robot/position",
+            "velocity": "joints/action/robot/velocity"
+        }
+    }
+}

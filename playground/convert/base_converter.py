@@ -146,13 +146,13 @@ def build_features(metadata: dict, h: int, w: int, robot_config: dict) -> tuple:
                 cam for cam in all_cameras
                 if cam in include_patterns or any(cam.startswith(p) for p in include_patterns)
             ]
-            logger.info(f"Using cameras: {use_cameras} (filtered from {all_cameras})")
+            # logger.info(f"Using cameras: {use_cameras} (filtered from {all_cameras})")
 
     # Build state names from config joint order
     # Support both flat keys (state/arm) and nested keys (state -> arm)
     state_names = []
     state_joints = robot_config["state_joints"]
-    hardcoded_names =robot_config.get("hardcoded_names",[])
+    hardcoded_names =robot_config.get("hardcoded_names",{})
 
 
     for joint_key in state_joints["order"]:
@@ -460,7 +460,7 @@ def main():
                         help="Task description")
     parser.add_argument("--fps", type=int, default=30, help="Dataset FPS")
     parser.add_argument("--workers", type=int, default=4, help="Number of worker processes")
-    parser.add_argument("--batch_size", type=int, default=1,
+    parser.add_argument("--batch_size", type=int, default=3,
                         help="Episodes per batch (reduce for memory issues)")
     parser.add_argument("--skip_merge", action="store_true",
                         help="Skip merge step (keep separate episode datasets)")

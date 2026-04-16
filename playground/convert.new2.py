@@ -23,7 +23,7 @@ DOWNLOAD_WORKERS_PER_TASK = 4
 CVT_WORKERS_PER_TASK = 6
 
 # 背压：最多下载领先多少个 task
-MAX_AHEAD = 5
+MAX_AHEAD = 1
 SENTINEL = object()
 
 # 路径相关
@@ -34,7 +34,7 @@ XLSX_IN = f"{HOME}/数据需求总表同步_转换列表.xlsx"
 
 LOCAL_TMP_ROOT = "/mnt/fastdisk/tmp_download"
 OUTPUT_ROOT = "/mnt/sdc/output_0331"
-CACHE_DIR = "/root/_robot_ckpt"
+CACHE_DIR = "/root/_robot3_ckpt"
 
 # 远端相关
 REMOTE_ROOT = "huawei-cloud:openloong-apps-prod-private/data-collector-svc/align"
@@ -48,6 +48,17 @@ DEVICE_COLUMN = "采集设备"
 DEVICE_TO_ROBOT = {
     "松灵Aloha": "cobotmagic",
     "Franka FR3": "fr3",
+    "傅利叶GR-2": "gr2",
+    "星尘智能S1": "astribot_s1",
+}
+
+# Tasks to filter for
+TARGET_TASKS = {
+    '7fdc9a1d008c4aa186a997485d198cec', 
+    '97f2a59c2fef489cb6c7ec7591961cd0',
+    '6a09fa0e3e7f470283528c3d44ae899d', 
+    '58c29ff274d84adea51424776fb6b92c', 
+    'c414d7dfb49d4c5dbe41a179ae645284',
 }
 
 # Base converter script path
@@ -98,18 +109,23 @@ def cvt_task(task_id: str, local_task_dir: str, task_dscp: str, device_name: str
     ]
     print(f"device_name: {device_name}, robot_name: {robot_name}")
     print(f"task_dscp: {task_dscp}")
-    try:
-        run(cmd, check=True)
-    except subprocess.CalledProcessError as e:
+
+    # Inline subprocess call to capture stderr without crashing the pipeline
+    result = subprocess.run(cmd, stderr=subprocess.PIPE, text=True)
+    
+    if result.returncode != 0:
+        stderr_msg = result.stderr if result.stderr else "No stderr captured"
         cache.set(f"convert_failure_{task_id}", {
             "task_id": task_id,
             "device": device_name,
             "robot": robot_name,
             "cmd": cmd,
-            "returncode": e.returncode,
-            "traceback": traceback.format_exc(),
+            "returncode": result.returncode,
+            "traceback": "Subprocess failed",
+            "stderr": stderr_msg,
         })
-        print(f"[FAILURE CACHED] {task_id}")
+        print(f"[FAILURE CACHED] {task_id} - Reason: {stderr_msg.strip()[:100]}...")
+
 
 
 def cleanup(local_task_dir: str):
@@ -145,6 +161,10 @@ def main():
         if not task_id:
             continue
         if task_id in seen_task_ids:
+            continue
+
+        # Filter for specific target tasks
+        if TARGET_TASKS and task_id not in TARGET_TASKS:
             continue
 
         device_name = row[device_col].value

@@ -194,9 +194,11 @@ data \
 7fdc9a1d008c4aa186a997485d198cec
 
 python convert/base_converter.py --robot astribot_s1 \
-    --input /mnt/fastdisk/tmp_download/7fdc9a1d008c4aa186a997485d198cec  \
-    --output /mnt/fastdisk/test/7fdc9a1d008c4aa186a997485d198cec \
-    --workers 1
+  --input /mnt/fastdisk/tmp_download/7fdc9a1d008c4aa186a997485d198cec  \
+  --output /mnt/fastdisk/test/7fdc9a1d008c4aa186a997485d198cec \
+  --workers 1
+
+python convert/check_joint_name_same.py --input /mnt/fastdisk/tmp_download/7fdc9a1d008c4aa186a997485d198cec
 
 
 
@@ -225,6 +227,11 @@ python convert_lerobot_v30.AstribotS1.jpeg.py \
 
 # fr3 ok
 ```bash
+6147a6da03af484098ad9290c55e1197
+# check exist
+./rclone lsf \
+  huawei-cloud:openloong-apps-prod-private/data-collector-svc/align/6a478ab39795427abfda96a9816e4955
+
 
 b6104a919ef14249966311b1ff8cd5a5
 
@@ -254,6 +261,8 @@ python convert/base_converter.py \
 ```bash
 73b116159fb24a2ca441ce26c1bc3b20
 
+python check_joint_limits.py --batch_dir  /mnt/fastdisk/tmp_download/73b116159fb24a2ca441ce26c1bc3b20 --max-frames 0
+/mnt/fastdisk/tmp_download/73b116159fb24a2ca441ce26c1bc3b20
 
 ./rclone copy \
   huawei-cloud:openloong-apps-prod-private/data-collector-svc/align/73b116159fb24a2ca441ce26c1bc3b20 \
@@ -274,6 +283,24 @@ python convert/base_converter.py --robot cobotmagic \
 
 ```
 
+# convert 
+TMPDIR=/mnt/sdc \
+TEMP=/mnt/sdc \
+TMP=/mnt/sdc \
+HF_LEROBOT_HOME=/mnt/sdc/lerobot_cache \
+HF_HOME=/mnt/sdc/huggingface  python convert.testset.py   
+
+TMPDIR=/mnt/fastdisk \
+TEMP=/mnt/fastdisk \
+TMP=/mnt/fastdisk \
+HF_LEROBOT_HOME=/mnt/fastdisk/huggingface/lerobot \
+HF_HOME=/mnt/fastdisk/huggingface  python convert.new2.py   
+
+TMPDIR=/mnt/fastdisk \
+TEMP=/mnt/fastdisk \
+TMP=/mnt/fastdisk \
+HF_LEROBOT_HOME=/mnt/fastdisk/huggingface/lerobot \
+HF_HOME=/mnt/fastdisk/huggingface  python convert.new2.g1.py   
 
 
 # 30 to 21
@@ -290,10 +317,41 @@ python cvt_30_to_21.py --repo-id 0005423097a649979efd61b44d4f30de --root /mnt/fa
   --progress
 
 
+./rclone lsf \
+  huawei-cloud:openloong-bigmodel/lerobotV3_data/robo_internal_req_20260401_v1/
+
+
+./rclone copy \
+  /mnt/sdc/output_0331_skipped \
+  huawei-cloud:openloong-bigmodel/lerobotV3_data/robo_internal_req_20260401_v1/  \
+  --progress
+
+./rclone copy \
+  /mnt/sdc/output_0331   \
+  huawei-cloud:openloong-bigmodel/lerobotV3_data/robo_internal_req_20260401_v1/  \
+  --progress
+
+
+./rclone copy  \
+  /mnt/fastdisk/output_0331_v21  \
+  huawei-cloud:openloong-bigmodel/lerobotv21/robo_internal_req_20260401_v1  \
+  --progress
+
+
+
+./rclone copy \
+  /mnt/sdc/output_v3_test_0331/v21_v2 \
+  huawei-cloud:openloong-bigmodel/lerobotv21/0331 \
+  --progress
+
+
 ./rclone mount \
 huawei-cloud:openloong-bigmodel/lerobotv21/existing_data \
 data \
 --daemon
+
+
+
 
 
 find /mnt/sdc/output -maxdepth 1 -mindepth 1 -type d -printf '%f\n' \
@@ -301,5 +359,26 @@ find /mnt/sdc/output -maxdepth 1 -mindepth 1 -type d -printf '%f\n' \
 | xargs -I{} -P 16 bash -c '
     echo "[START] {}"
     python cvt_30_to_21.py --repo-id "{}" --root /mnt/sdc/output
+'
+
+
+TMPDIR=/mnt/fastdisk \
+TEMP=/mnt/fastdisk \
+TMP=/mnt/fastdisk \
+HF_LEROBOT_HOME=/mnt/fastdisk/huggingface/lerobot \
+HF_HOME=/mnt/fastdisk/huggingface  \
+find /mnt/sdc/output_0331  -maxdepth 1 -mindepth 1 -type d -printf '%f\n' \
+| tqdm --total "$(find /mnt/sdc/output_0331  -maxdepth 1 -mindepth 1 -type d | wc -l)" --unit repo \
+| xargs -I{} -P 16 bash -c '
+    echo "[START] {}"
+    python cvt_30_to_21.py --repo-id "{}" --root /mnt/sdc/output_0331 
+'
+
+
+find /mnt/sdc/output_v3_test_0331 -maxdepth 1 -mindepth 1 -type d -printf '%f\n' \
+| tqdm --total "$(find /mnt/sdc/output_v3_test_0331 -maxdepth 1 -mindepth 1 -type d | wc -l)" --unit repo \
+| xargs -I{} -P 16 bash -c '
+    echo "[START] {}"
+    python cvt_30_to_21.py --repo-id "{}" --root /mnt/sdc/output_v3_test_0331
 '
 ```

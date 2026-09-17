@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import os
 
 import torch
 from torch import nn
@@ -73,18 +74,25 @@ class SmolVLMWithExpertModel(nn.Module):
         device: str = "auto",
     ):
         super().__init__()
+        # Reconstruction/evaluation may run on a machine without egress even
+        # though the complete VLM snapshot is already in the HF cache.  Pass
+        # the standard Hugging Face offline contract through to *both* model
+        # and processor construction.  Without this, AutoProcessor can still
+        # probe the Hub for optional chat-template files.
+        local_files_only = os.environ.get("HF_HUB_OFFLINE", "").strip().lower() in {"1", "true", "yes"}
         if load_vlm_weights:
             print(f"Loading  {model_id} weights ...")
             self.vlm = AutoModelForImageTextToText.from_pretrained(
                 model_id,
                 torch_dtype="bfloat16",
                 low_cpu_mem_usage=True,
+                local_files_only=local_files_only,
             )
             config = self.vlm.config
         else:
-            config = AutoConfig.from_pretrained(model_id)
+            config = AutoConfig.from_pretrained(model_id, local_files_only=local_files_only)
             self.vlm = SmolVLMForConditionalGeneration(config=config)
-        self.processor = AutoProcessor.from_pretrained(model_id)
+        self.processor = AutoProcessor.from_pretrained(model_id, local_files_only=local_files_only)
         if num_vlm_layers > 0:
             print(f"Reducing the number of VLM layers to {num_vlm_layers} ...")
             self.get_vlm_model().text_model.layers = self.get_vlm_model().text_model.layers[:num_vlm_layers]
@@ -136,36 +144,22 @@ class SmolVLMWithExpertModel(nn.Module):
         return self.vlm.model
 
     def set_requires_grad(self):
-        if self.freeze_vision_encoder:
-            self.get_vlm_model().vision_model.eval()
-            for params in self.get_vlm_model().vision_model.parameters():
-                params.requires_grad = False
         if self.train_expert_only:
             self.vlm.eval()
             for params in self.vlm.parameters():
                 params.requires_grad = False
         else:
-            # To avoid unused params issue with distributed training
-            last_layers = [self.num_vlm_layers - 1]
-            if (
-                self.num_vlm_layers != self.num_expert_layers
-                and self.num_vlm_layers % self.num_expert_layers == 0
-            ):
-                last_layers.append(self.num_vlm_layers - 2)
-            frozen_layers = [
-                "lm_head",
-                "text_model.model.norm.weight",
-            ]
-            for layer in last_layers:
-                frozen_layers.append(f"text_model.model.layers.{layer}.")
-
-            for name, params in self.vlm.named_parameters():
-                if any(k in name for k in frozen_layers):
-                    params.requires_grad = False
-        # To avoid unused params issue with distributed training
-        for name, params in self.lm_expert.named_parameters():
-            if "lm_head" in name:
+            # Full fine-tuning: do not retain the old expert-only exclusions.
+            # The training entry point enables DDP find_unused_parameters, so
+            # parameters absent from a conditional action-loss path are safe.
+            for params in self.vlm.parameters():
+                params.requires_grad = True
+        if self.freeze_vision_encoder:
+            self.get_vlm_model().vision_model.eval()
+            for params in self.get_vlm_model().vision_model.parameters():
                 params.requires_grad = False
+        for params in self.lm_expert.parameters():
+            params.requires_grad = True
 
     def train(self, mode: bool = True):
         super().train(mode)

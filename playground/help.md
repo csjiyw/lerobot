@@ -261,12 +261,27 @@ python convert/base_converter.py \
 ```bash
 73b116159fb24a2ca441ce26c1bc3b20
 
+ec37fad6f7364a99916be6ea31597232
+
+06911227af864ee4be3665b01ba48de1 草莓入盘并叠杯
+ec37fad6f7364a99916be6ea31597232 蔬菜块入碗与容器剧中
+1d7fe9a4cacd4f66b689fd931356c0e7 抽屉筷子取放与餐具对齐
+06911227af864ee4be3665b01ba48de1 **Place strawberry on plate and stack cup**
+Align with the strawberry; grasp the strawberry; align with the blue plate; place the strawberry on the blue plate; align with the red cup; grasp the red cup; stack the red cup on the blue plate.
+
+ec37fad6f7364a99916be6ea31597232 **Place vegetable block into bowl and center the container**
+Align with the white vegetable block; grasp the white vegetable block; align with the white bowl; place the white vegetable block into the white bowl; align with the white bowl; move the white bowl to the center of the table; straighten the position of the white bowl.
+
+1d7fe9a4cacd4f66b689fd931356c0e7 **Take chopsticks from drawer and align tableware**
+Align with the second-layer drawer handle; open the second-layer drawer; align with the chopsticks; grasp the chopsticks; align with the empty space next to the white bowl; place the chopsticks next to the white bowl; straighten the direction of the chopsticks; close the second-layer drawer.
+
+
 python check_joint_limits.py --batch_dir  /mnt/fastdisk/tmp_download/73b116159fb24a2ca441ce26c1bc3b20 --max-frames 0
 /mnt/fastdisk/tmp_download/73b116159fb24a2ca441ce26c1bc3b20
 
-./rclone copy \
-  huawei-cloud:openloong-apps-prod-private/data-collector-svc/align/73b116159fb24a2ca441ce26c1bc3b20 \
-  /mnt/fastdisk/tmp_download/73b116159fb24a2ca441ce26c1bc3b20 \
+rclone copy \
+  huawei-cloud:openloong-apps-prod-private/data-collector-svc/align/ec37fad6f7364a99916be6ea31597232 \
+  ec37fad6f7364a99916be6ea31597232 \
   --progress
 
 python cobotmagic_align2lerobot_v30.jpeg.py \
@@ -277,9 +292,27 @@ python cobotmagic_align2lerobot_v30.jpeg.py \
 --workers 1
 
 python convert/base_converter.py --robot cobotmagic \
-    --input /mnt/fastdisk/tmp_download/73b116159fb24a2ca441ce26c1bc3b20  \
-    --output /mnt/fastdisk/test/73b116159fb24a2ca441ce26c1bc3b20 \
-    --workers 1
+  --input /mnt/fastdisk/tmp_download/73b116159fb24a2ca441ce26c1bc3b20  \
+  --output /mnt/fastdisk/test/73b116159fb24a2ca441ce26c1bc3b20 \
+  --workers 1
+
+python convert/base_converter.py --robot cobotmagic \
+  --input /media/fuxin/59b726b5-293a-4235-af97-1e18589c462e/lerobot0_4_0/lerobot/data/06911227af864ee4be3665b01ba48de1  \
+  --output /media/fuxin/59b726b5-293a-4235-af97-1e18589c462e/lerobot0_4_0/lerobot/data/output/06911227af864ee4be3665b01ba48de1 \
+  --task "Align with the strawberry; grasp the strawberry; align with the blue plate; place the strawberry on the blue plate; align with the red cup; grasp the red cup; stack the red cup on the blue plate."  \
+  --workers 2
+
+python convert/base_converter.py --robot cobotmagic \
+  --input /media/fuxin/59b726b5-293a-4235-af97-1e18589c462e/lerobot0_4_0/lerobot/data/ec37fad6f7364a99916be6ea31597232  \
+  --output /media/fuxin/59b726b5-293a-4235-af97-1e18589c462e/lerobot0_4_0/lerobot/data/output/ec37fad6f7364a99916be6ea31597232 \
+  --task "Align with the white vegetable block; grasp the white vegetable block; align with the white bowl; place the white vegetable block into the white bowl; align with the white bowl; move the white bowl to the center of the table; straighten the position of the white bowl."  \
+  --workers 2
+
+python convert/base_converter.py --robot cobotmagic \
+  --input /media/fuxin/59b726b5-293a-4235-af97-1e18589c462e/lerobot0_4_0/lerobot/data/1d7fe9a4cacd4f66b689fd931356c0e7  \
+  --output /media/fuxin/59b726b5-293a-4235-af97-1e18589c462e/lerobot0_4_0/lerobot/data/output/1d7fe9a4cacd4f66b689fd931356c0e7 \
+  --task "Align with the second-layer drawer handle; open the second-layer drawer; align with the chopsticks; grasp the chopsticks; align with the empty space next to the white bowl; place the chopsticks next to the white bowl; straighten the direction of the chopsticks; close the second-layer drawer."  \
+  --workers 2
 
 ```
 
@@ -308,6 +341,7 @@ HF_HOME=/mnt/fastdisk/huggingface  python convert.new2.g1.py
 
 python cvt_30_to_21.py --repo-id 0005423097a649979efd61b44d4f30de --root /mnt/fastdisk/output
 
+python cvt_30_to_21.py --repo-id ec37fad6f7364a99916be6ea31597232 --root /media/fuxin/59b726b5-293a-4235-af97-1e18589c462e/lerobot0_4_0/lerobot/data/output
 
 
 

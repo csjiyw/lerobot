@@ -16,6 +16,7 @@
 import contextlib
 import glob
 import importlib
+import json
 import logging
 import queue
 import shutil
@@ -146,16 +147,75 @@ def decode_video_frames(
     Returns:
         torch.Tensor: Decoded frames.
 
-    Currently supports torchcodec on cpu and pyav.
+    Currently supports torchcodec, pyav, and the conda ``ffmpeg`` CLI.
     """
     if backend is None:
         backend = get_safe_default_codec()
     if backend == "torchcodec":
         return decode_video_frames_torchcodec(video_path, timestamps, tolerance_s)
+    elif backend == "ffmpeg":
+        return decode_video_frames_ffmpeg(video_path, timestamps, tolerance_s)
     elif backend in ["pyav", "video_reader"]:
         return decode_video_frames_torchvision(video_path, timestamps, tolerance_s, backend)
     else:
         raise ValueError(f"Unsupported video backend: {backend}")
+
+
+def decode_video_frames_ffmpeg(
+    video_path: Path | str,
+    timestamps: list[float],
+    tolerance_s: float,
+) -> torch.Tensor:
+    """Decode a contiguous, constant-FPS query window with the ``ffmpeg`` CLI.
+
+    LeRobot action chunks request nearby timestamps (normally 30 consecutive
+    30-Hz frames).  One FFmpeg process decodes that whole window rather than
+    spawning a process per frame.  This backend intentionally requires a CFR
+    stream; our Cobot Magic MP4 recordings are 30-Hz CFR.
+    """
+    if not timestamps:
+        raise ValueError("timestamps must not be empty")
+    video_path = str(video_path)
+    try:
+        probe = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=width,height,avg_frame_rate",
+                "-of", "json", video_path,
+            ],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        stream = json.loads(probe.stdout)["streams"][0]
+        width, height = int(stream["width"]), int(stream["height"])
+        fps = float(Fraction(stream["avg_frame_rate"]))
+    except (FileNotFoundError, subprocess.CalledProcessError, KeyError, ValueError, ZeroDivisionError) as exc:
+        raise RuntimeError(f"FFmpeg probe failed for {video_path}") from exc
+    if fps <= 0:
+        raise RuntimeError(f"invalid video FPS {fps} for {video_path}")
+
+    ordered = np.asarray(timestamps, dtype=np.float64)
+    first_index = int(round(float(ordered.min()) * fps))
+    last_index = int(round(float(ordered.max()) * fps))
+    if not np.allclose(ordered * fps, np.rint(ordered * fps), atol=max(tolerance_s * fps, 1e-4)):
+        raise FrameTimestampError("ffmpeg backend requires timestamps aligned to the CFR frame grid")
+    count = last_index - first_index + 1
+    command = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-ss", f"{first_index / fps:.9f}", "-i", video_path,
+        "-frames:v", str(count), "-an", "-sn", "-dn",
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
+    ]
+    result = subprocess.run(command, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    bytes_per_frame = width * height * 3
+    if result.returncode != 0 or len(result.stdout) < bytes_per_frame * count:
+        message = result.stderr.decode(errors="replace").strip()
+        raise RuntimeError(f"FFmpeg decode failed for {video_path}: {message}")
+    decoded = np.frombuffer(result.stdout[: bytes_per_frame * count], dtype=np.uint8)
+    decoded = decoded.reshape(count, height, width, 3)
+    query_indices = np.rint(ordered * fps).astype(np.int64) - first_index
+    if query_indices.min() < 0 or query_indices.max() >= count:
+        raise FrameTimestampError("ffmpeg decoded window does not contain every requested timestamp")
+    return torch.from_numpy(decoded[query_indices].copy()).permute(0, 3, 1, 2).float() / 255.0
 
 
 def decode_video_frames_torchvision(

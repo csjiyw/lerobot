@@ -17,7 +17,9 @@
 from __future__ import annotations
 
 import importlib
+import json
 import logging
+from pathlib import Path
 from typing import Any, TypedDict
 
 import torch
@@ -39,6 +41,7 @@ from lerobot.policies.sac.configuration_sac import SACConfig
 from lerobot.policies.sac.reward_model.configuration_classifier import RewardClassifierConfig
 from lerobot.policies.sarm.configuration_sarm import SARMConfig
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+from lerobot.policies.smolvla_rlt.configuration_smolvla_rlt import SmolVLARLTConfig
 from lerobot.policies.tdmpc.configuration_tdmpc import TDMPCConfig
 from lerobot.policies.utils import validate_visual_features_consistency
 from lerobot.policies.vqbet.configuration_vqbet import VQBeTConfig
@@ -115,6 +118,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
         return SmolVLAPolicy
+    elif name == "smolvla_rlt":
+        from lerobot.policies.smolvla_rlt.modeling_smolvla_rlt import SmolVLARLTPolicy
+
+        return SmolVLARLTPolicy
     elif name == "sarm":
         from lerobot.policies.sarm.modeling_sarm import SARMRewardModel
 
@@ -173,6 +180,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return SACConfig(**kwargs)
     elif policy_type == "smolvla":
         return SmolVLAConfig(**kwargs)
+    elif policy_type == "smolvla_rlt":
+        return SmolVLARLTConfig(**kwargs)
     elif policy_type == "reward_classifier":
         return RewardClassifierConfig(**kwargs)
     elif policy_type == "groot":
@@ -211,6 +220,23 @@ class ProcessorConfigKwargs(TypedDict, total=False):
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None
 
 
+def _saved_preprocessor_has_relative_eef_step(pretrained_path: str | Path) -> bool:
+    """True when the checkpoint's saved preprocessor contains the relative-EEF step.
+
+    Only our own relative-EEF checkpoints qualify. A base/absolute checkpoint
+    (e.g. the pretrained SmolVLA base model) has no such step, so its saved
+    processor must not be reused for a relative-EEF fine-tune.
+    """
+    preprocessor_file = Path(pretrained_path) / f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json"
+    if not preprocessor_file.is_file():
+        return False
+    preprocessor = json.loads(preprocessor_file.read_text())
+    return any(
+        step.get("registry_name") == "smolvla_relative_eef_chunk"
+        for step in preprocessor.get("steps", [])
+    )
+
+
 def make_pre_post_processors(
     policy_cfg: PreTrainedConfig,
     pretrained_path: str | None = None,
@@ -242,6 +268,26 @@ def make_pre_post_processors(
             policy configuration type.
     """
     if pretrained_path:
+        # A chunk-relative EEF SmolVLA changes the semantics and statistics of
+        # `action`.  The base SmolVLA processor saved next to pretrained_path
+        # normalizes absolute actions and has no relative-chunk step, so it
+        # cannot be reused for this fine-tune.
+        if isinstance(policy_cfg, SmolVLAConfig) and policy_cfg.use_relative_eef_actions:
+            if not _saved_preprocessor_has_relative_eef_step(pretrained_path):
+                from lerobot.policies.smolvla.processor_smolvla import make_smolvla_pre_post_processors
+
+                # Fresh relative-EEF fine-tune from a base/absolute checkpoint:
+                # build a processor with the relative-chunk step and relative
+                # action statistics; state follows the standard
+                # normalization_mapping + dataset_stats machinery.
+                return make_smolvla_pre_post_processors(
+                    config=policy_cfg,
+                    dataset_stats=kwargs.get("dataset_stats"),
+                )
+
+            # A saved relative-EEF processor is complete and self-contained.
+            # Fall through to the standard pretrained processor loader below.
+
         # TODO(Steven): Temporary patch, implement correctly the processors for Gr00t
         if isinstance(policy_cfg, GrootConfig):
             # GROOT handles normalization in groot_pack_inputs_v3 step
@@ -353,6 +399,14 @@ def make_pre_post_processors(
         from lerobot.policies.smolvla.processor_smolvla import make_smolvla_pre_post_processors
 
         processors = make_smolvla_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, SmolVLARLTConfig):
+        from lerobot.policies.smolvla_rlt.processor_smolvla_rlt import make_smolvla_rlt_pre_post_processors
+
+        processors = make_smolvla_rlt_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )

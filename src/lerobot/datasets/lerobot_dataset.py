@@ -15,9 +15,12 @@
 # limitations under the License.
 import concurrent.futures
 import contextlib
+import json
 import logging
+import os
 import shutil
 import tempfile
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -78,6 +81,34 @@ from lerobot.datasets.video_utils import (
     get_video_info,
     resolve_vcodec,
 )
+
+
+# Opt-in, worker-safe dataset timing. Set LEROBOT_DATA_PROFILE_DIR to an empty
+# directory before constructing a DataLoader; each worker writes an aggregate
+# JSON report every 100 samples. Normal training has zero profiling work.
+_DATA_PROFILE_DIR = os.environ.get("LEROBOT_DATA_PROFILE_DIR")
+_DATA_PROFILE_STATS: dict[str, float] = {}
+_DATA_PROFILE_COUNT = 0
+
+
+def _record_data_profile(**durations: float) -> None:
+    """Accumulate and periodically publish per-worker dataset timings."""
+    global _DATA_PROFILE_COUNT
+    if not _DATA_PROFILE_DIR:
+        return
+    _DATA_PROFILE_COUNT += 1
+    for key, duration in durations.items():
+        _DATA_PROFILE_STATS[key] = _DATA_PROFILE_STATS.get(key, 0.0) + duration
+    if _DATA_PROFILE_COUNT % 100:
+        return
+    profile_dir = Path(_DATA_PROFILE_DIR)
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "pid": os.getpid(),
+        "samples": _DATA_PROFILE_COUNT,
+        "mean_ms": {key: 1000.0 * value / _DATA_PROFILE_COUNT for key, value in _DATA_PROFILE_STATS.items()},
+    }
+    (profile_dir / f"worker_{os.getpid()}.json").write_text(json.dumps(payload, indent=2) + "\n")
 from lerobot.utils.constants import HF_LEROBOT_HOME
 
 CODEBASE_VERSION = "v3.0"
@@ -556,14 +587,14 @@ def _encode_video_worker(
     temp_path = Path(tempfile.mkdtemp(dir=root)) / f"{video_key}_{episode_index:03d}.mp4"
     fpath = DEFAULT_IMAGE_PATH.format(image_key=video_key, episode_index=episode_index, frame_index=0,ext="unknow")
     img_dir = (root / fpath).parent
-    encode_video_frames2(img_dir, temp_path, fps,
+    stat=encode_video_frames3(img_dir, temp_path, fps,
                         # vcodec="h264_nvenc",
                         # g=None,          # NVENC 通常不需要你手动设 GOP
                         # crf=None,        # NVENC 不用 CRF vcodec=vcodec, overwrite=True
     )
     shutil.rmtree(img_dir)
     # print("temp_path",temp_path)
-    return temp_path
+    return temp_path,stat
 
 
 class LeRobotDataset(torch.utils.data.Dataset):
@@ -1056,17 +1087,34 @@ class LeRobotDataset(torch.utils.data.Dataset):
         the main process and a subprocess fails to access it.
         """
         ep = self.meta.episodes[ep_idx]
-        item = {}
-        for vid_key, query_ts in query_timestamps.items():
+        def decode_one(vid_key: str, query_ts: list[float]) -> tuple[str, torch.Tensor, float]:
             # Episodes are stored sequentially on a single mp4 to reduce the number of files.
             # Thus we load the start timestamp of the episode on this mp4 and,
             # shift the query timestamp accordingly.
             from_timestamp = ep[f"videos/{vid_key}/from_timestamp"]
             shifted_query_ts = [from_timestamp + ts for ts in query_ts]
-
             video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
+            start = time.perf_counter() if _DATA_PROFILE_DIR else 0.0
             frames = decode_video_frames(video_path, shifted_query_ts, self.tolerance_s, self.video_backend)
-            item[vid_key] = frames.squeeze(0)
+            decode_s = time.perf_counter() - start if _DATA_PROFILE_DIR else 0.0
+            return vid_key, frames.squeeze(0), decode_s
+
+        # Camera files are independent. In particular the Cobot Magic front
+        # and right streams can be decoded by two FFmpeg processes at once.
+        # Keep the pool local to a sample, so DataLoader worker lifecycle and
+        # existing TorchCodec decoder-cache ownership remain unchanged.
+        video_items = list(query_timestamps.items())
+        if len(video_items) <= 1:
+            decoded = [decode_one(*video_items[0])] if video_items else []
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(2, len(video_items))) as executor:
+                decoded = list(executor.map(lambda pair: decode_one(*pair), video_items))
+
+        item = {vid_key: frames for vid_key, frames, _ in decoded}
+        if _DATA_PROFILE_DIR:
+            for vid_key, _, decode_s in decoded:
+                key = f"decode_{vid_key}_s"
+                _DATA_PROFILE_STATS[key] = _DATA_PROFILE_STATS.get(key, 0.0) + decode_s
 
         return item
 
@@ -1085,30 +1133,45 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx) -> dict:
         # Ensure dataset is loaded when we actually need to read from it
+        profile_start = time.perf_counter() if _DATA_PROFILE_DIR else 0.0
         self._ensure_hf_dataset_loaded()
+        stage_start = time.perf_counter() if _DATA_PROFILE_DIR else 0.0
         item = self.hf_dataset[idx]
+        hf_item_s = time.perf_counter() - stage_start if _DATA_PROFILE_DIR else 0.0
         ep_idx = item["episode_index"].item()
         # Use the absolute index from the dataset for delta timestamp calculations
         abs_idx = item["index"].item()
 
         query_indices = None
         if self.delta_indices is not None:
+            stage_start = time.perf_counter() if _DATA_PROFILE_DIR else 0.0
             query_indices, padding = self._get_query_indices(abs_idx, ep_idx)
             query_result = self._query_hf_dataset(query_indices)
             item = {**item, **padding}
             for key, val in query_result.items():
                 item[key] = val
+            query_s = time.perf_counter() - stage_start if _DATA_PROFILE_DIR else 0.0
+        else:
+            query_s = 0.0
 
         if len(self.meta.video_keys) > 0:
+            stage_start = time.perf_counter() if _DATA_PROFILE_DIR else 0.0
             current_ts = item["timestamp"].item()
             query_timestamps = self._get_query_timestamps(current_ts, query_indices)
             video_frames = self._query_videos(query_timestamps, ep_idx)
             item = {**video_frames, **item}
+            videos_s = time.perf_counter() - stage_start if _DATA_PROFILE_DIR else 0.0
+        else:
+            videos_s = 0.0
 
         if self.image_transforms is not None:
+            stage_start = time.perf_counter() if _DATA_PROFILE_DIR else 0.0
             image_keys = self.meta.camera_keys
             for cam in image_keys:
                 item[cam] = self.image_transforms(item[cam])
+            image_transform_s = time.perf_counter() - stage_start if _DATA_PROFILE_DIR else 0.0
+        else:
+            image_transform_s = 0.0
 
         # Add task as a string
         task_idx = item["task_index"].item()
@@ -1118,6 +1181,15 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if "subtask_index" in self.features and self.meta.subtasks is not None:
             subtask_idx = item["subtask_index"].item()
             item["subtask"] = self.meta.subtasks.iloc[subtask_idx].name
+
+        if _DATA_PROFILE_DIR:
+            _record_data_profile(
+                hf_item_s=hf_item_s,
+                action_query_s=query_s,
+                videos_s=videos_s,
+                image_transform_s=image_transform_s,
+                total_getitem_s=time.perf_counter() - profile_start,
+            )
 
         return item
 

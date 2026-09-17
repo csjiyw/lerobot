@@ -1,0 +1,6 @@
+layout {
+    pane {
+        args "-lc" "cd /media/fuxin/59b726b5-293a-4235-af97-1e18589c462e/lerobot0_4_0/lerobot && exec env COBOT_CUDA_DEVICE=0,1 COBOT_NUM_PROCESSES=2 COBOT_BATCH_SIZE=32 COBOT_NUM_WORKERS=16 COBOT_TRAIN_STEPS=20000 COBOT_SAVE_FREQ=5000 COBOT_LOG_FREQ=100 COBOT_IMAGE_HEIGHT=512 COBOT_IMAGE_WIDTH=512 COBOT_RUN_NAME=cobot_magic_smolvla_cross_073_anchor_relative_eef_chunk30_bc20k_globalbs64_512x512_dualgpu_photoaug bash scripts/train_cobot_magic_smolvla_cross_073_relative_eef_bc100k_gpu0.sh"
+        command "bash"
+    }
+}

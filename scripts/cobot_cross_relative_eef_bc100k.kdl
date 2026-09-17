@@ -1,0 +1,5 @@
+layout {
+    pane cwd="/media/fuxin/59b726b5-293a-4235-af97-1e18589c462e/lerobot0_4_0/lerobot" command="bash" {
+        args "-lc" "exec ./scripts/train_cobot_magic_smolvla_cross_073_relative_eef_bc100k_gpu0.sh"
+    }
+}

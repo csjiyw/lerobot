@@ -59,6 +59,15 @@ class SmolVLAConfig(PreTrainedConfig):
     # Gripper dimensions will remain in absolute values.
     use_delta_joint_actions_aloha: bool = False
 
+    # Express every EEF target in a chunk relative to the single current
+    # observation state, matching GR00T relative_chunking semantics.
+    # The normalization of state/action is controlled by the standard
+    # `normalization_mapping` (IDENTITY / MIN_MAX / QUANTILES / MEAN_STD); the
+    # checkpoint's saved processor persists the mapping together with the exact
+    # statistics training used, and is loaded back at inference and on resume.
+    use_relative_eef_actions: bool = False
+    relative_eef_action_stats_path: str | None = None
+
     # Tokenizer
     tokenizer_max_length: int = 48
 
@@ -72,6 +81,9 @@ class SmolVLAConfig(PreTrainedConfig):
     freeze_vision_encoder: bool = True
     train_expert_only: bool = True
     train_state_proj: bool = True
+    # Hide the complete normalized state vector for a training sample with
+    # this probability. Inference never applies this dropout.
+    state_dropout: float = 0.0
 
     # Training presets
     optimizer_lr: float = 1e-4
@@ -118,6 +130,8 @@ class SmolVLAConfig(PreTrainedConfig):
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "
                 f"{self.n_action_steps} for `n_action_steps` and {self.chunk_size} for `chunk_size`."
             )
+        if not 0.0 <= self.state_dropout <= 1.0:
+            raise ValueError(f"`state_dropout` must be in [0, 1], got {self.state_dropout}.")
         if self.use_delta_joint_actions_aloha:
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."

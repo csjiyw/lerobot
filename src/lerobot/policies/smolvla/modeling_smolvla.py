@@ -222,6 +222,21 @@ def aloha_gripper_from_angular_inv(value):
     return normalize(value, min_val=0.4, max_val=1.5)
 
 
+def _drop_state_features(
+    state_features: Tensor, probability: float, training: bool
+) -> tuple[Tensor, Tensor]:
+    """Drop each sample's complete projected state feature, as in GR00T N1.7."""
+    if not training or probability <= 0.0:
+        return state_features, torch.zeros(
+            (), device=state_features.device, dtype=state_features.dtype
+        )
+
+    mask_shape = (state_features.shape[0],) + (1,) * (state_features.ndim - 1)
+    drop_mask = torch.rand(mask_shape, device=state_features.device) < probability
+    kept = (~drop_mask).to(dtype=state_features.dtype)
+    return state_features * kept, drop_mask.to(dtype=state_features.dtype).mean()
+
+
 class SmolVLAPolicy(PreTrainedPolicy):
     """Wrapper class around VLAFlowMatching model to train and run inference within LeRobot."""
 
@@ -320,6 +335,30 @@ class SmolVLAPolicy(PreTrainedPolicy):
         return actions
 
     @torch.no_grad()
+    def predict_action_chunk_with_rlt_prefix(
+        self, batch: dict[str, Tensor], noise: Tensor | None = None, **kwargs: Unpack[ActionSelectKwargs]
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Infer one action chunk and return the prefix states from its KV-cache pass."""
+        self.eval()
+        batch = self._prepare_batch(batch)
+        images, img_masks = self.prepare_images(batch)
+        state = self.prepare_state(batch)
+        actions, prefix, prefix_mask = self.model.sample_actions(
+            images,
+            img_masks,
+            batch[OBS_LANGUAGE_TOKENS],
+            batch[OBS_LANGUAGE_ATTENTION_MASK],
+            state,
+            noise=noise,
+            return_rlt_prefix=True,
+            **kwargs,
+        )
+        actions = actions[:, :, : self.config.action_feature.shape[0]]
+        if self.config.adapt_to_pi_aloha:
+            actions = self._pi_aloha_encode_actions(actions)
+        return actions, prefix, prefix_mask
+
+    @torch.no_grad()
     def select_action(
         self, batch: dict[str, Tensor], noise: Tensor | None = None, **kwargs: Unpack[ActionSelectKwargs]
     ) -> Tensor:
@@ -375,7 +414,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
         actions = self.prepare_action(batch)
-        actions_is_pad = batch.get("actions_id_pad")
+        actions_is_pad = batch.get("action_is_pad")
         loss_dict = {}
         losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
         loss_dict["losses_after_forward"] = losses.clone().mean().item()
@@ -399,6 +438,34 @@ class SmolVLAPolicy(PreTrainedPolicy):
             loss = losses.mean()
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
+
+    def forward_with_rlt_prefix(
+        self, batch: dict[str, Tensor], noise=None, time=None
+    ) -> tuple[Tensor, Tensor, Tensor, dict[str, float]]:
+        """Joint Stage 1 forward used by the RLinf-style RLT objective."""
+        if self.config.adapt_to_pi_aloha:
+            batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
+            batch[ACTION] = self._pi_aloha_encode_actions_inv(batch[ACTION])
+
+        images, img_masks = self.prepare_images(batch)
+        state = self.prepare_state(batch)
+        actions = self.prepare_action(batch)
+        losses, prefix_out, prefix_mask = self.model.forward_with_rlt_prefix(
+            images,
+            img_masks,
+            batch[OBS_LANGUAGE_TOKENS],
+            batch[OBS_LANGUAGE_ATTENTION_MASK],
+            state,
+            actions,
+            noise=noise,
+            time=time,
+        )
+        actions_is_pad = batch.get("action_is_pad")
+        if actions_is_pad is not None:
+            losses = losses * (~actions_is_pad).unsqueeze(-1)
+        losses = losses[:, :, : self.config.max_action_dim]
+        vla_loss = losses.mean()
+        return vla_loss, prefix_out, prefix_mask, {"vla_loss": float(vla_loss.detach())}
 
     def prepare_images(self, batch):
         """Apply SmolVLA preprocessing to the images, like resizing to 224x224 and padding to keep aspect ratio, and
@@ -691,6 +758,9 @@ class VLAFlowMatching(nn.Module):
 
         state_emb = self.state_proj(state)
         state_emb = state_emb[:, None, :] if state_emb.ndim == 2 else state_emb
+        state_emb, _ = _drop_state_features(
+            state_emb, probability=self.config.state_dropout, training=self.training
+        )
         embs.append(state_emb)
         bsize = state_emb.shape[0]
         device = state_emb.device
@@ -763,6 +833,28 @@ class VLAFlowMatching(nn.Module):
         self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
     ) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
+        losses, _, _ = self.forward_with_rlt_prefix(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            actions,
+            noise=noise,
+            time=time,
+        )
+        return losses
+
+    def forward_with_rlt_prefix(
+        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Compute flow loss and expose the action-independent prefix states.
+
+        The prefix attention mask prevents image/language/state tokens from
+        attending to the action suffix.  Returning the prefix output from the
+        same forward pass therefore follows RLinf Stage 1 without paying for a
+        second VLA pass.
+        """
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
 
@@ -782,7 +874,7 @@ class VLAFlowMatching(nn.Module):
 
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
-        (_, suffix_out), _ = self.vlm_with_expert.forward(
+        (prefix_out, suffix_out), _ = self.vlm_with_expert.forward(
             attention_mask=att_2d_masks,
             position_ids=position_ids,
             past_key_values=None,
@@ -795,7 +887,69 @@ class VLAFlowMatching(nn.Module):
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)
         losses = F.mse_loss(u_t, v_t, reduction="none")
-        return losses
+        return losses, prefix_out, prefix_pad_masks
+
+    def extract_rlt_prefix(
+        self, images, img_masks, lang_tokens, lang_masks, state
+    ) -> tuple[Tensor, Tensor]:
+        """Return deployment-time prefix states without any action input."""
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, state=state
+        )
+        attention_mask = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        (prefix_out, _), _ = self.vlm_with_expert.forward(
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=self.config.use_cache,
+            fill_kv_cache=True,
+        )
+        return prefix_out, prefix_pad_masks
+
+    def extract_legacy_rlt_embeddings(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        actions,
+        noise=None,
+        time=None,
+    ) -> tuple[Tensor, Tensor]:
+        """Return the VLM/expert states expected by legacy action-conditioned RLT.
+
+        The first Cobot Magic Stage 1 run was trained with the community
+        implementation's action-conditioned bottleneck.  Keep this narrowly
+        named compatibility path so those immutable checkpoints remain
+        runnable without changing the newer RLinf prefix-only pipeline.
+        """
+        if noise is None:
+            noise = self.sample_noise(actions.shape, actions.device)
+        if time is None:
+            time = self.sample_time(actions.shape[0], actions.device)
+
+        time_expanded = time[:, None, None]
+        x_t = time_expanded * noise + (1 - time_expanded) * actions
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, state=state
+        )
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+        attention_mask = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        (prefix_out, suffix_out), _ = self.vlm_with_expert.forward(
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, suffix_embs],
+            use_cache=False,
+            fill_kv_cache=False,
+        )
+        return prefix_out, suffix_out[:, -self.config.chunk_size :]
 
     def sample_actions(
         self,
@@ -805,9 +959,17 @@ class VLAFlowMatching(nn.Module):
         lang_masks,
         state,
         noise=None,
+        return_rlt_prefix: bool = False,
+        suffix_offset: Tensor | None = None,
         **kwargs: Unpack[ActionSelectKwargs],
-    ) -> Tensor:
-        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
+    ) -> Tensor | tuple[Tensor, Tensor, Tensor]:
+        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors).
+
+        ``suffix_offset`` (batch, chunk_size, expert_hidden) shifts the
+        flow-matching conditioning at every denoise step to
+        ``c'_t = c_t + suffix_offset`` (latent-residual injection).  It is
+        fixed across the denoise trajectory and is None on the base path.
+        """
         bsize = state.shape[0]
         device = state.device
 
@@ -821,7 +983,7 @@ class VLAFlowMatching(nn.Module):
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         # Compute image and language key value cache
-        _, past_key_values = self.vlm_with_expert.forward(
+        (prefix_out, _), past_key_values = self.vlm_with_expert.forward(
             attention_mask=prefix_att_2d_masks,
             position_ids=prefix_position_ids,
             past_key_values=None,
@@ -843,6 +1005,7 @@ class VLAFlowMatching(nn.Module):
                     prefix_pad_masks=prefix_pad_masks,
                     past_key_values=past_key_values,
                     timestep=current_timestep,
+                    suffix_offset=suffix_offset,
                 )
 
             if self._rtc_enabled():
@@ -866,6 +1029,8 @@ class VLAFlowMatching(nn.Module):
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
 
+        if return_rlt_prefix:
+            return x_t, prefix_out, prefix_pad_masks
         return x_t
 
     def denoise_step(
@@ -874,9 +1039,19 @@ class VLAFlowMatching(nn.Module):
         past_key_values,
         x_t,
         timestep,
+        suffix_offset=None,
     ):
-        """Apply one denoising step of the noise `x_t` at a given timestep."""
+        """Apply one denoising step of the noise `x_t` at a given timestep.
+
+        ``suffix_offset`` is an optional (batch, chunk_size, expert_hidden)
+        offset added to the action-query (suffix) embeddings, i.e. the
+        flow-matching conditioning is shifted per step to
+        ``c'_t = c_t + suffix_offset``.  ``None`` keeps the exact base path.
+        """
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
+
+        if suffix_offset is not None:
+            suffix_embs = suffix_embs + suffix_offset.to(suffix_embs.dtype)
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]

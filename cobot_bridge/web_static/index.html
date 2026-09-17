@@ -1,0 +1,689 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Cobot Data Studio</title>
+    <link rel="stylesheet" href="/static/styles.css?v=20260913-arm-state-vertical-1" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="top-brand">
+        <p class="eyebrow">COBOT MAGIC · RIGHT ARM</p>
+        <h1>IL / RL / RLT Studio</h1>
+      </div>
+      <div class="top-init-action">
+        <span>ARM POSITION</span>
+        <button id="moveRltInitPoseButton" class="button secondary" title="Move master + puppet, left + right, to the configured neutral pose">RETURN TO INIT</button>
+      </div>
+      <div class="top-actions">
+        <div class="top-status-actions">
+          <span id="bridgeBadge" class="badge offline">Bridge offline</span>
+          <button id="refreshButton" class="button ghost">刷新</button>
+        </div>
+        <div class="top-emergency-actions">
+          <button id="exitStopButton" class="button warning" title="Clear the automatic-control stop latch" disabled>EXIT STOP</button>
+          <button id="safeButton" class="button danger" title="Latch policy/replay off; physical Teach remains highest priority">EMERGENCY STOP</button>
+        </div>
+      </div>
+    </header>
+
+    <main class="dashboard-shell">
+      <section id="robotStrip" class="robot-strip">
+        <div><span>Mode</span><strong id="modeValue">—</strong></div>
+        <div><span>Teach</span><strong id="teachValue">—</strong></div>
+        <div><span>Policy Output</span><strong id="outputValue">—</strong></div>
+        <div><span>Control</span><strong id="controlValue">—</strong></div>
+        <div><span>Hardware</span><strong id="hardwareValue">—</strong></div>
+      </section>
+
+      <section class="global-camera-strip" aria-label="Live camera preview">
+        <div class="global-camera-heading">
+          <p class="eyebrow">LIVE CAMERAS</p>
+          <div class="device-badges">
+            <span id="previewRouteValue" class="badge">Preview: PC relay MJPEG</span>
+            <span id="deviceSummary" class="badge offline">0 / 7 OK</span>
+          </div>
+        </div>
+        <div class="camera-grid global-camera-grid">
+          <article class="camera-card" data-camera-card="front">
+            <div class="camera-label"><strong>Front camera</strong><span id="cameraFrontStatus">OFFLINE</span></div>
+            <div class="camera-viewport"><img id="cameraFrontLive" alt="Front camera live preview"><span class="live-tag">LIVE · PC RELAY MJPEG</span></div>
+            <small id="cameraFrontMeta">No frame</small>
+          </article>
+          <article class="camera-card" data-camera-card="left">
+            <div class="camera-label"><strong>Left camera</strong><span id="cameraLeftStatus">OFFLINE</span></div>
+            <div class="camera-viewport"><img id="cameraLeftLive" alt="Left camera live preview"><span class="live-tag">LIVE · PC RELAY MJPEG</span></div>
+            <small id="cameraLeftMeta">No frame</small>
+          </article>
+          <article class="camera-card" data-camera-card="right">
+            <div class="camera-label"><strong>Right camera</strong><span id="cameraRightStatus">OFFLINE</span></div>
+            <div class="camera-viewport"><img id="cameraRightLive" alt="Right camera live preview"><span class="live-tag">LIVE · PC RELAY MJPEG</span></div>
+            <small id="cameraRightMeta">No frame</small>
+          </article>
+        </div>
+      </section>
+
+      <nav class="module-tabs" aria-label="Dashboard modules">
+        <button class="module-tab active" data-tab="il">IL Collect</button>
+        <button class="module-tab" data-tab="rl">RL Collect</button>
+        <button class="module-tab" data-tab="rlt">RLT</button>
+        <button class="module-tab" data-tab="data">Data</button>
+        <button class="module-tab" data-tab="jobs">Jobs &amp; Logs</button>
+        <button class="module-tab" data-tab="system">System</button>
+      </nav>
+
+      <div class="tab-content">
+      <section class="tab-panel active" data-panel="il">
+      <div class="single-workflow">
+        <article class="workflow-card il-card">
+          <div class="card-number">01</div>
+          <div class="card-heading">
+            <p class="eyebrow">IMITATION LEARNING</p>
+            <h2>采集 IL 示教 Episode</h2>
+            <p>启动录制后，按下 Teach 完成一次示教；松开 Teach 自动结束并标记 success。</p>
+          </div>
+
+          <div class="init-pose-control">
+            <div>
+              <strong>Four-arm Ready Pose</strong>
+              <small>Verified non-singular joint preset · master + puppet · left + right</small>
+            </div>
+            <div class="motion-confirm compact">四条机械臂都会移动</div>
+            <button id="moveInitPoseButton" class="button secondary">Move to Ready Pose</button>
+          </div>
+
+          <label>Task instruction
+            <input id="ilTask" value="pick and place the object" />
+          </label>
+          <div class="two-columns">
+            <label>Collection
+              <input id="ilCollection" value="cobot_magic_il" />
+            </label>
+            <label>FPS
+              <input id="ilFps" type="number" value="30" min="1" max="60" />
+            </label>
+          </div>
+          <label class="check-row">
+            <input id="ilRightCamera" type="checkbox" checked /> Front + right camera
+          </label>
+          <label class="check-row">
+            <input id="ilTeachAutosave" type="checkbox" checked /> Exit Teach mode → auto-save episode
+          </label>
+          <div class="paired-actions">
+            <button id="startIlButton" class="button secondary">仅开始 IL 录制</button>
+            <button id="startIlWithInitButton" class="button primary">Init → 开始 IL 录制</button>
+          </div>
+          <div class="il-result-actions">
+            <button id="saveIlSuccessButton" class="button success" disabled>Save Success</button>
+            <button id="saveIlFailureButton" class="button failure" disabled>Save Failure</button>
+            <button id="abortIlButton" class="button aborted" disabled>Abort &amp; Discard</button>
+          </div>
+          <p id="ilRecordHint" class="hint">勾选后 Teach 松开自动保存 Success；Abort 会丢弃本次录制，不保存数据。</p>
+        </article>
+      </div>
+      </section>
+
+      <section class="tab-panel" data-panel="rl">
+      <div class="workflow-grid rl-layout">
+        <article class="workflow-card rl-card">
+          <div class="card-number">02</div>
+          <div class="card-heading">
+            <p class="eyebrow">REINFORCEMENT LEARNING</p>
+            <h2>采集 RL + Human Intervention</h2>
+            <p>统一采集所有 policy rollout。IL policy 数据可用于 RLT 初始阶段，Actor policy 数据用于后续在线更新。</p>
+          </div>
+
+          <div class="init-pose-control">
+            <div>
+              <strong>Four-arm Ready Pose</strong>
+              <small>Start before recording · verified non-singular preset · all four arms</small>
+            </div>
+            <div class="motion-confirm compact">初始化不计入 RL episode</div>
+            <button id="moveRlInitPoseButton" class="button secondary">Return to Ready Pose</button>
+          </div>
+
+          <label>Task instruction
+            <input id="rlTask" value="pick and place the object" />
+          </label>
+          <div class="two-columns">
+            <label>Collection
+              <input id="rlCollection" value="cobot_magic_rl" />
+            </label>
+            <label>FPS
+              <input id="rlFps" type="number" value="30" min="1" max="60" />
+            </label>
+          </div>
+          <label class="check-row">
+            <input id="rlTeachAutosave" type="checkbox" /> Exit Teach mode → auto-save Success
+          </label>
+          <label class="check-row">
+            <input id="rlAutoStartPolicy" type="checkbox" /> Auto-start selected policy mode with recorder
+          </label>
+          <label>RL rollout mode
+            <select id="rlPolicyMode">
+              <option value="1">Mode 1 · right puppet only</option>
+              <option value="2" selected>Mode 2 · right master + puppet</option>
+            </select>
+          </label>
+          <button id="startRlButton" class="button primary wide">开始 RL 录制</button>
+          <div class="rl-result-actions">
+            <button id="saveRlSuccessButton" class="button success" disabled>Save Success</button>
+            <button id="saveRlFailureButton" class="button failure" disabled>Save Failure</button>
+            <button id="abortRlButton" class="button aborted" disabled>Abort &amp; Discard</button>
+          </div>
+          <p id="rlRecordHint" class="hint">加载 IL 模型即采集 RLT 初始数据；加载 Actor 即采集在线数据。采集格式相同，差异只记录在 policy metadata。</p>
+        </article>
+
+        <div class="policy-stack">
+          <article class="workflow-card model-server-card">
+            <div class="card-number">04</div>
+            <div class="card-heading compact-heading">
+              <p class="eyebrow">MODEL SERVER</p>
+              <h2>Load Model Once</h2>
+              <p>加载 checkpoint 到 GPU 并保持运行；本步骤不会控制机械臂。</p>
+            </div>
+            <div class="server-status-row">
+              <span id="policyServerBadge" class="badge offline">Offline</span>
+              <small id="policyServerDetail">No model loaded</small>
+            </div>
+            <label>Inference GPU
+              <select id="policyComputeSelect">
+                <option value="pc">PC GPU</option>
+                <option value="robot">Robot GPU · 192.168.250.2</option>
+              </select>
+            </label>
+            <label>PC GPU device
+              <select id="policyDeviceSelect">
+                <option value="cuda:0">GPU 0 · training</option>
+                <option value="cuda:1">GPU 1</option>
+              </select>
+            </label>
+            <label>Training run
+              <select id="policyRunSelect"></select>
+            </label>
+            <label>Checkpoint step
+              <select id="policySelect"></select>
+            </label>
+            <label>Inference chunking
+              <select id="policyInferenceChunking">
+                <option value="original" selected>Original · independent full chunks</option>
+                <option value="guided_rtc">Guided RTC · terminal continuity</option>
+              </select>
+            </label>
+            <p id="policyChunkingHint" class="hint">Original sampling: each model chunk is generated independently.</p>
+            <p class="hint">Feature schema and normalization are restored from this checkpoint.</p>
+            <div class="paired-actions">
+              <button id="startPolicyServerButton" class="button secondary">Start Model Server</button>
+              <button id="stopPolicyServerButton" class="button ghost" disabled>Stop Server</button>
+            </div>
+          </article>
+
+          <article class="workflow-card rollout-card">
+            <div class="card-number">03</div>
+            <div class="card-heading compact-heading">
+              <p class="eyebrow">POLICY ROLLOUT</p>
+              <h2>Run One Rollout</h2>
+              <p>连接 Ready server；rollout 默认从当前实测姿态开始，不要求先回 Ready Pose。Teach 接管后清空动作，松开后结束 rollout。</p>
+            </div>
+            <label>Rollout speed
+              <select id="rolloutFps">
+                <option value="7.5">0.25× · 7.5 FPS</option>
+                <option value="15" selected>0.5× · 15 FPS</option>
+                <option value="22.5">0.75× · 22.5 FPS</option>
+                <option value="30">1.0× · 30 FPS</option>
+              </select>
+            </label>
+            <p class="hint">Controls action playback rate relative to the 30 FPS training data.</p>
+            <label>Execution pipeline
+              <select id="rolloutRunner">
+                <option value="standard" selected>Standard · sequential chunks</option>
+                <option value="smooth_v2">Smooth V2 · overlapping chunks</option>
+                <option value="smooth_v3">Smooth V3 · robust + jerk limited</option>
+                <option value="edge_v4">Edge V4 · full chunk + edge blend</option>
+                <option value="eef_v5">EEF V5 · Cartesian v/a + Pink IK</option>
+                <option value="guided_rtc">Guided RTC · full chunk + terminal prefix</option>
+            </select>
+            </label>
+            <label>Action space
+              <select id="rolloutActionSpace">
+                <option value="joint" selected>Joint absolute · existing path</option>
+                <option value="eef_delta">EEF delta · model state-relative</option>
+                <option value="eef_target">EEF target chunk · absolute</option>
+              </select>
+            </label>
+            <label>EEF IK backend
+              <select id="rolloutEefIkBackend">
+                <option value="pink" selected>Pink IK · JointState 200 Hz (recommended)</option>
+                <option value="sdk">Piper SDK EndPoseCtrl · legacy</option>
+              </select>
+            </label>
+            <p class="hint">Pink converts each model EEF target to a bounded 200 Hz joint chunk. The SDK option sends PosCmd directly and is kept for comparison.</p>
+            <p class="hint">V4 preserves the full 30 FPS chunk and changes only its first three edge actions. V2/V3 continuously smooth overlapping predictions.</p>
+            <label>Actions consumed per rollout chunk
+              <input id="rolloutActionSteps" type="number" value="" min="1" max="50" placeholder="All model output" />
+            </label>
+            <p class="hint">Leave empty to consume the complete action chunk reported by the loaded model.</p>
+            <label class="motion-confirm compact-rollout-confirm">
+              <input id="rolloutMotionConfirm" type="checkbox" />
+              <span>允许 rollout 驱动 right master / puppet 真实机械臂</span>
+            </label>
+            <div class="paired-actions">
+              <button id="startRolloutButton" class="button secondary">Puppet Only · Mode 1</button>
+              <button id="startSyncRolloutButton" class="button primary">Sync M+P · Mode 2</button>
+            </div>
+            <button id="stopRolloutButton" class="button danger wide" disabled>Stop Rollout</button>
+            <p id="rolloutHint" class="hint">Start Model Server and wait for Ready first. Ready Pose is optional; rollout uses the current measured pose.</p>
+          </article>
+        </div>
+      </div>
+      </section>
+
+      <section class="tab-panel" data-panel="rlt">
+      <div class="rlt-layout">
+        <details class="rlt-checks">
+          <summary>
+            <span><strong>Checks &amp; Diagnostics</strong><small>Stage 1 validation and read-only shadow tools</small></span>
+            <span class="badge offline">Optional · No motion</span>
+          </summary>
+          <div class="rlt-check-layout">
+        <article class="workflow-card rlt-stage-card">
+          <div class="card-number">C1</div>
+          <div class="card-heading">
+            <p class="eyebrow">RLT STAGE 1 ARTIFACT</p>
+            <h2>验证 RL Token Encoder</h2>
+            <p>检查 Stage 1、基础 SmolVLA、真实 embedding 维度和 strict weight loading。本步骤不连接或控制机械臂。</p>
+          </div>
+          <dl class="rlt-facts">
+            <div><dt>Status</dt><dd id="rltCheckpointStatus">No checkpoint</dd></div>
+            <div><dt>Embedding</dt><dd id="rltEmbeddingShape">—</dd></div>
+            <div><dt>z_rl / chunk</dt><dd id="rltTokenShape">—</dd></div>
+            <div><dt>Training</dt><dd id="rltTrainingSummary">—</dd></div>
+            <div><dt>Base policy</dt><dd id="rltBasePolicy">—</dd></div>
+          </dl>
+          <button id="validateRltButton" class="button secondary wide">Validate Stage 1</button>
+          <p id="rltValidateHint" class="hint">CPU strict-load and finite-forward check; no robot connection.</p>
+        </article>
+
+        <article class="workflow-card rlt-shadow-card">
+          <div class="card-number">C2</div>
+          <div class="card-heading">
+            <p class="eyebrow">PC SHADOW PIPELINE</p>
+            <h2>Run RLT Read-only</h2>
+            <p>读取 bridge 的 right puppet state、front/right 图像，运行 SmolVLA → embedding → z_rl，并记录 reference action；强制 action_sent=false。</p>
+          </div>
+          <div class="two-columns">
+            <label>Shadow inference rate (not control FPS)
+              <select id="rltShadowFps">
+                <option value="1">1 Hz</option>
+                <option value="2">2 Hz</option>
+                <option value="5">5 Hz</option>
+                <option value="10">10 Hz target</option>
+                <option value="15">15 Hz target</option>
+                <option value="30" selected>30 Hz target</option>
+              </select>
+            </label>
+            <label>Diagnostic window
+              <select id="rltShadowDuration">
+                <option value="0" selected>Until stopped</option>
+                <option value="30">30 seconds</option>
+                <option value="60">60 seconds</option>
+                <option value="300">5 minutes</option>
+              </select>
+            </label>
+          </div>
+          <div class="rlt-safety-lock">
+            <strong>READ ONLY</strong>
+            <span>No mode request · No output enable · No action publisher</span>
+          </div>
+          <div class="paired-actions">
+            <button id="startRltShadowButton" class="button primary">Start Shadow</button>
+            <button id="stopRltShadowButton" class="button danger" disabled>Stop Shadow</button>
+          </div>
+          <p id="rltShadowHint" class="hint">Runs until you press Stop. 30 Hz is a scheduling target; actual FPS is limited by full-model inference latency. This remains read-only and does not change the robot's 200 Hz command scheduler.</p>
+        </article>
+          </div>
+        </details>
+
+        <article class="workflow-card rlt-server-card">
+          <div class="card-number">01</div>
+          <div class="card-heading">
+            <p class="eyebrow">GPU 0 · PERSISTENT</p>
+            <h2>RLT Rollout Server</h2>
+            <p>常驻加载 SmolVLA、Stage 1 encoder 和 actor。训练发布的新 actor 只会在下一次 episode 开始时切换。</p>
+          </div>
+          <label>Stage 1 checkpoint
+            <select id="rltCheckpointSelect"></select>
+          </label>
+          <label>Actor checkpoint
+            <select id="rltActorCheckpointSelect"></select>
+          </label>
+          <div class="server-status-row">
+            <span id="rltServerBadge" class="badge offline">Offline</span>
+            <small id="rltServerEndpoint">tcp://127.0.0.1:5561</small>
+          </div>
+          <dl class="rlt-facts">
+            <div><dt>Stage 1</dt><dd id="rltServerStage1">—</dd></div>
+            <div><dt>Actor / Generation</dt><dd id="rltServerActor">—</dd></div>
+            <div><dt>Episode</dt><dd id="rltServerEpisode">idle</dd></div>
+          </dl>
+          <div class="rlt-safety-lock">
+            <strong>NO MOTION</strong>
+            <span>Server only performs inference; the collection client owns robot output.</span>
+          </div>
+          <div class="paired-actions">
+            <button id="startRltServerButton" class="button primary">Start Server</button>
+            <button id="stopRltServerButton" class="button danger" disabled>Stop Server</button>
+          </div>
+          <button id="rollbackRlt30kButton" class="button warning wide" disabled>Rollback Actor to 30k</button>
+          <p id="rollbackRlt30kHint" class="hint">Fixed recovery point: checkpoint_00030000.pt. No robot motion.</p>
+          <p id="rltServerHint" class="hint">Select Stage 1 and Actor. Pre-RL Actor BC is selected by default.</p>
+        </article>
+
+        <article class="workflow-card rlt-online-card">
+          <div class="card-number">02</div>
+          <div class="card-heading">
+            <p class="eyebrow">RLT STAGE 2 · ONLINE</p>
+            <h2>Actor–Critic Training</h2>
+            <p>后续在这里管理 replay buffer、reward、actor/critic checkpoint、在线 update 和完整动作 Actor rollout。</p>
+          </div>
+          <div class="rlt-stage-gate">
+            <span id="rltOnlineBadge" class="badge offline">Locked</span>
+            <p id="rltOnlineReason">Cobot Magic Stage 2 adapter has not passed shadow validation.</p>
+          </div>
+          <label>Task instruction
+            <input id="rltTask" value="pick and place the cross object" />
+          </label>
+          <div class="two-columns">
+            <label>Online collection
+              <input id="rltOnlineCollection" value="cobot_magic_rlt" />
+            </label>
+            <label>Actor exploration σ
+              <select id="rltExplorationStd">
+                <option value="0">0 · deterministic</option>
+                <option value="0.0001">0.0001 · ~0.01–0.014 mm / 0.001°</option>
+                <option value="0.0005">0.0005 · ~0.05–0.07 mm / 0.005°</option>
+                <option value="0.001">0.001 · ~0.10–0.14 mm / 0.009°</option>
+                <option value="0.002">0.002 · ~0.2–0.3 mm / 0.02° (noise level)</option>
+                <option value="0.005">0.005 · ~0.5–0.7 mm / 0.05°</option>
+                <option value="0.01">0.01 · ~1.0–1.4 mm / 0.09°</option>
+                <option value="0.02" selected>0.02 · ~2.0–2.7 mm / 0.18° (moderate, recommended)</option>
+                <option value="0.05">0.05 · ~5.0–6.9 mm / 0.45° (high)</option>
+                <option value="0.1">0.1 · ~9.8–13.7 mm / 0.9° (very high)</option>
+              </select>
+            </label>
+            <label>Q 候选挑选 (best-of-K)
+              <select id="rltQSelect">
+                <option value="0" selected>off · 单次探索噪声（现状）</option>
+                <option value="1">仅干净输出 · 无噪声</option>
+                <option value="11">11 候选 · 1 干净 + 10 噪声 · Q 选最优</option>
+                <option value="21">21 候选 · 1 干净 + 20 噪声 · Q 选最优</option>
+              </select>
+            </label>
+            <label>Rollout speed
+              <select id="rltRolloutSpeed">
+                <option value="0.25">0.25× · 30 → 120 points</option>
+                <option value="0.5">0.5× · 30 → 60 points</option>
+                <option value="0.75">0.75×</option>
+                <option value="1" selected>1.0× · original 30 points</option>
+              </select>
+            </label>
+            <label>RLT smooth profile
+              <select id="rltSmoothProfile">
+                <option value="edge_v4" selected>Edge V4 · EEF → Pink IK → joint v/a</option>
+                <option value="raw">Raw · no PC filter, bridge 200 Hz interpolation only</option>
+                <option value="smooth_v3">Smooth V3 · joint only (not EEF RLT)</option>
+                <option value="smooth_v2">Smooth V2 · joint only (not EEF RLT)</option>
+              </select>
+            </label>
+          </div>
+          <label class="check-row">
+            <input id="rltActorEefGate" type="checkbox" checked />
+            启用阶段切换：reference 先抓取；夹爪开→合且进入当前 fixture 对位区后，RLT Actor 才接管
+          </label>
+          <label class="check-row danger-check">
+            <input id="rltMotionConfirm" type="checkbox" /> I confirm the workspace is clear for real Online RLT motion
+          </label>
+          <div class="rlt-phase-heading">
+            <p class="eyebrow">PHASE B · TRAINED ACTOR</p>
+            <strong>Actor Rollout</strong>
+            <span id="rltActorGate">Locked until the first validated Stage 2 checkpoint</span>
+          </div>
+          <section class="rlt-mode-card autonomous">
+            <div class="rlt-mode-title"><span>DIAGNOSTIC</span><strong>Stage 1 Reference Only</strong></div>
+            <p>仅执行 Stage 1 内的 reference VLA；Actor residual 关闭、exploration 强制为 0。记录结果但不加入 replay，也不触发异步训练。</p>
+            <button id="startRltReferenceButton" class="button secondary wide" disabled>Start Reference-only · Mode 1</button>
+          </section>
+          <div class="rlt-online-modes">
+            <section class="rlt-mode-card autonomous">
+              <div class="rlt-mode-title"><span>MODE 1</span><strong>Actor · Pure Online RL</strong></div>
+              <p>Policy 只控制 right puppet；master 不跟随。此流程不使用 Teach，只记录 autonomous transition 和最终 Success/Failure reward。</p>
+              <button id="startRltMode1Button" class="button primary wide" disabled>Start Mode 1 · Autonomous</button>
+            </section>
+            <section class="rlt-mode-card intervention">
+              <div class="rlt-mode-title"><span>MODE 2</span><strong>Actor · Human Intervention</strong></div>
+              <p>Policy 同步控制 right master + puppet；Teach 接管时 puppet 跟随 master，并记录 human action 与 intervention transition。</p>
+              <button id="startRltMode2Button" class="button primary wide" disabled>Start Mode 2 · HITL</button>
+            </section>
+          </div>
+          <div class="rlt-auto-pipeline">
+            <div class="rlt-pipeline-heading">
+              <div><p class="eyebrow">POST-EPISODE PIPELINE</p><strong>自动处理与训练</strong></div>
+              <span id="rltPipelineBadge" class="badge offline">Not connected</span>
+            </div>
+            <ol>
+              <li><span>01</span><div><strong>Raw record</strong><small>30 Hz images/state/actions/intervention</small></div></li>
+              <li><span>02</span><div><strong>Terminal label</strong><small>Success / Failure；Abort 直接丢弃</small></div></li>
+              <li><span>03</span><div><strong>Replay transitions</strong><small>直接构建 RLT replay buffer；LeRobot 异步归档</small></div></li>
+              <li><span>04</span><div><strong>Actor–critic update</strong><small>每条已标注 Actor rollout 自动进入异步更新</small></div></li>
+            </ol>
+            <section id="rltTrainerProgressPanel" class="rlt-trainer-progress idle" aria-live="polite">
+              <div class="rlt-trainer-progress-heading">
+                <strong id="rltTrainerProgressTitle">Trainer idle</strong>
+                <span id="rltTrainerEta">ETA —</span>
+              </div>
+              <div class="rlt-progress-track" role="progressbar" aria-label="RLT trainer progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+                <div id="rltTrainerProgressBar" class="rlt-progress-bar"></div>
+              </div>
+              <div class="rlt-trainer-progress-meta">
+                <code id="rltTrainerProgressText">0/0 · 0.0% · — upd/s</code>
+                <small id="rltTrainerMetrics">critic — · actor —</small>
+              </div>
+            </section>
+            <p id="rltPipelineHint" class="hint">当前仅为流程定义；Stage 2 adapter 尚未接通，不会自动记录、转换或训练。</p>
+          </div>
+          <div class="rlt-outcome-panel">
+            <div>
+              <p class="eyebrow">EPISODE OUTCOME · REWARD</p>
+              <strong>结束一次 Online RLT episode</strong>
+            </div>
+            <div class="rlt-result-actions">
+              <button id="saveRltSuccessButton" class="button success" disabled>Success · Reward 1</button>
+              <button id="saveRltFailureButton" class="button failure" disabled>Failure · Reward 0</button>
+              <button id="abortRltButton" class="button aborted" disabled>Abort &amp; Discard</button>
+            </div>
+            <p id="rltOutcomeHint" class="hint">只有 Online RLT rollout 可以打 episode reward；Shadow 不保存 reward。Teach 接管区间会自动标记 intervention，但最终 Success/Failure 仍由人工选择。</p>
+          </div>
+          <p class="hint">不会调用原仓库的 SO-101 Stage 2 脚本。真实输出必须在完成 Cobot Magic adapter、离线测试和 shadow 验证后单独解锁。</p>
+        </article>
+      </div>
+      </section>
+
+      <section class="tab-panel" data-panel="system">
+      <div class="system-layout">
+      <div class="panel device-panel">
+        <div class="panel-heading device-heading">
+          <div>
+            <p class="eyebrow">ARM FEEDBACK</p>
+            <h2>4 Arms</h2>
+          </div>
+        </div>
+        <div class="arm-grid">
+          <article class="arm-card" data-arm-card="master_left">
+            <div><span class="device-dot"></span><strong>Master Left</strong></div>
+            <span id="armMasterLeftStatus">OFFLINE</span>
+            <small id="armMasterLeftMeta" class="arm-joint-state">No joint state</small>
+          </article>
+          <article class="arm-card" data-arm-card="master_right">
+            <div><span class="device-dot"></span><strong>Master Right</strong></div>
+            <span id="armMasterRightStatus">OFFLINE</span>
+            <small id="armMasterRightMeta" class="arm-joint-state">No joint state</small>
+          </article>
+          <article class="arm-card" data-arm-card="puppet_left">
+            <div><span class="device-dot"></span><strong>Puppet Left</strong></div>
+            <span id="armPuppetLeftStatus">OFFLINE</span>
+            <small id="armPuppetLeftMeta" class="arm-joint-state">No joint state</small>
+          </article>
+          <article class="arm-card" data-arm-card="puppet_right">
+            <div><span class="device-dot"></span><strong>Puppet Right</strong></div>
+            <span id="armPuppetRightStatus">OFFLINE</span>
+            <small id="armPuppetRightMeta" class="arm-joint-state">No joint state</small>
+          </article>
+        </div>
+
+      </div>
+
+      <div class="panel readiness-panel">
+        <div>
+          <p class="eyebrow">RLT READINESS</p>
+          <h2>训练与部署状态</h2>
+        </div>
+        <div id="capabilityList" class="capability-list"></div>
+        <div>
+          <p class="eyebrow">DEVICE RECOVERY</p>
+          <h2>Restart Arms + Cameras + Live</h2>
+          <p id="restartDevicesHint" class="hint">Stops rollout, then restarts four-arm ROS, all three camera nodes and the AGX-local JPEG preview service. Bridge and model server stay online.</p>
+          <button id="restartDevicesButton" class="button danger wide">Restart All Devices</button>
+        </div>
+      </div>
+      </div>
+      </section>
+
+      <section class="tab-panel" data-panel="data">
+      <div class="data-layout">
+        <div class="data-action-stack">
+        <article class="panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">RAW → LEROBOT</p>
+              <h2>转换 Episode</h2>
+            </div>
+          </div>
+          <label>Raw collection
+            <select id="convertRawCollection"></select>
+          </label>
+          <input id="convertRaw" type="hidden" />
+          <p class="hint">Select the episode from the list on the right. The highlighted episode will be converted.</p>
+          <label>Dataset name
+            <input id="datasetName" value="cobot_magic_episode_001" />
+          </label>
+          <label>Action rule
+            <select id="convertActionSource">
+              <option value="puppet_state_t3_arm_cmd_gripper">IL · Arm state[t+3] + command gripper</option>
+              <option value="executed_action">RL · Executed action</option>
+            </select>
+          </label>
+          <label class="check-row">
+            <input id="convertTrimHolds" type="checkbox" checked /> Trim Teach wait and stationary holds
+          </label>
+          <button id="convertButton" class="button secondary wide">开始转换</button>
+          <p id="dataRootHint" class="hint"></p>
+        </article>
+
+        <article class="panel replay-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">TRAJECTORY TEST</p>
+              <h2>Replay Selected Episode</h2>
+            </div>
+          </div>
+          <p class="hint">Uses the highlighted episode's recorded puppet command targets at 30 Hz. Measured puppet state is not replayed. Replay is a trajectory/communication test, not RL.</p>
+          <div class="two-columns">
+            <label>Speed
+              <select id="replaySpeed">
+                <option value="0.5">0.5×</option>
+                <option value="0.75">0.75×</option>
+                <option value="1">1.0×</option>
+              </select>
+            </label>
+            <label class="check-row lower">
+              <input id="replayLoop" type="checkbox" checked /> Loop until Teach
+            </label>
+          </div>
+          <label class="motion-confirm compact-replay-confirm">
+            <input id="replayMotionConfirm" type="checkbox" />
+            <span>允许 replay 驱动真实机械臂</span>
+          </label>
+          <div class="paired-actions">
+            <button id="startReplayButton" class="button warning">Replay Highlighted Episode</button>
+            <button id="stopReplayButton" class="button danger" disabled>Stop Replay</button>
+          </div>
+          <p id="replayHint" class="hint">Teach or Stop Replay immediately ends replay and returns the robot to SAFE.</p>
+        </article>
+        </div>
+
+        <article class="panel episode-browser-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">RAW EPISODES</p>
+              <h2>Episode Browser</h2>
+            </div>
+          </div>
+          <div class="episode-browser">
+            <section class="episode-list-section">
+              <div class="episode-section-heading">
+                <strong>Episodes</strong>
+                <span id="episodeListCount">0</span>
+              </div>
+              <div id="rawEpisodeList" class="episode-list"><p class="empty">No episodes.</p></div>
+            </section>
+            <section class="episode-detail">
+              <p class="eyebrow">SELECTED EPISODE</p>
+              <h3 id="episodeDetailTitle">No episode selected</h3>
+              <dl>
+                <div><dt>Task</dt><dd id="episodeDetailTask">—</dd></div>
+                <div><dt>Task setup</dt><dd id="episodeDetailSetup">—</dd></div>
+                <div><dt>Objective</dt><dd id="episodeDetailObjective">—</dd></div>
+                <div><dt>Outcome</dt><dd id="episodeDetailOutcome">—</dd></div>
+                <div><dt>Collection type</dt><dd id="episodeDetailType">—</dd></div>
+                <div><dt>Frames / FPS</dt><dd id="episodeDetailFrames">—</dd></div>
+                <div><dt>Size</dt><dd id="episodeDetailSize">—</dd></div>
+                <div><dt>Raw path</dt><dd id="episodeDetailPath">—</dd></div>
+              </dl>
+            </section>
+          </div>
+        </article>
+      </div>
+      </section>
+
+      <section class="tab-panel" data-panel="jobs">
+      <div class="jobs-layout">
+        <article class="panel jobs-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">PROCESS CONTROL</p>
+              <h2>运行任务</h2>
+            </div>
+            <button id="refreshJobsButton" class="button ghost small">刷新</button>
+          </div>
+          <div id="jobsList" class="jobs-list"><p class="empty">暂无任务</p></div>
+        </article>
+
+      <section class="panel log-panel">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">LIVE LOG</p>
+            <h2 id="logTitle">选择一个任务查看日志</h2>
+          </div>
+        </div>
+        <pre id="logOutput">No job selected.</pre>
+      </section>
+      </div>
+      </section>
+      </div>
+    </main>
+
+    <div id="toast" class="toast hidden"></div>
+    <script src="/static/app.js?v=20260917-rollout-current-pose-1"></script>
+  </body>
+</html>

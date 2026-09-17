@@ -1,0 +1,6 @@
+layout {
+    pane name="smolvla-il-bs64" cwd="/media/fuxin/59b726b5-293a-4235-af97-1e18589c462e/lerobot0_4_0/lerobot" command="bash" {
+        args "-lc" "set -o pipefail; export COBOT_RUN_NAME=cobot_magic_smolvla_il_001_200k_bs64_zellij; scripts/train_cobot_magic_smolvla_il.sh 2>&1 | tee outputs/cobot_magic_smolvla_il_001_200k_bs64_zellij.log"
+        close_on_exit false
+    }
+}

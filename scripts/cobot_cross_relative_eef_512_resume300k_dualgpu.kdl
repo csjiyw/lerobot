@@ -1,0 +1,6 @@
+layout {
+    pane {
+        command "bash"
+        args "-lc" "cd /media/fuxin/59b726b5-293a-4235-af97-1e18589c462e/lerobot0_4_0/lerobot && exec bash scripts/cobot_cross_relative_eef_512_resume300k_dualgpu.sh"
+    }
+}

@@ -1,0 +1,5 @@
+layout {
+    pane command="bash" {
+        args "-lc" "cd /media/fuxin/59b726b5-293a-4235-af97-1e18589c462e/lerobot0_4_0/lerobot && exec env COBOT_CUDA_DEVICE=1 COBOT_TRAIN_STEPS=120 COBOT_SAVE_FREQ=1000 COBOT_LOG_FREQ=20 COBOT_RUN_NAME=cobot_magic_smolvla_cross_073_anchor_relative_eef_chunk30_bench120_bs64_256x256_gpu1_photoaug bash scripts/train_cobot_magic_smolvla_cross_073_relative_eef_bc100k_gpu0.sh"
+    }
+}

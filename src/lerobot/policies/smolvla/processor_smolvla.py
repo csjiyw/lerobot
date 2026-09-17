@@ -14,7 +14,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import dataclass
+import json
+from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 import torch
 
@@ -27,13 +32,16 @@ from lerobot.processor import (
     NormalizerProcessorStep,
     PolicyAction,
     PolicyProcessorPipeline,
+    ProcessorStep,
     ProcessorStepRegistry,
     RenameObservationsProcessorStep,
     TokenizerProcessorStep,
     UnnormalizerProcessorStep,
+    TransitionKey,
 )
 from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
+from lerobot.policies.smolvla.relative_eef import chunk_to_relative
 
 
 def make_smolvla_pre_post_processors(
@@ -66,9 +74,22 @@ def make_smolvla_pre_post_processors(
         A tuple containing the configured pre-processor and post-processor pipelines.
     """
 
+    normalization_stats = dataset_stats
+    if config.use_relative_eef_actions:
+        if not config.relative_eef_action_stats_path:
+            raise ValueError("relative EEF actions require relative_eef_action_stats_path")
+        stats_path = Path(config.relative_eef_action_stats_path).expanduser()
+        relative_stats = json.loads(stats_path.read_text())
+        normalization_stats = dict(dataset_stats or {})
+        # Action statistics must describe the relative chunk, not the absolute
+        # EEF targets stored in the dataset. State and the remaining features
+        # follow the standard normalization_mapping + dataset stats machinery.
+        normalization_stats["action"] = relative_stats["action"]
+
     input_steps = [
         RenameObservationsProcessorStep(rename_map={}),  # To mimic the same processor as pretrained one
         AddBatchDimensionProcessorStep(),
+        *([SmolVLARelativeEEFChunkProcessor()] if config.use_relative_eef_actions else []),
         SmolVLANewLineProcessor(),
         TokenizerProcessorStep(
             tokenizer_name=config.vlm_model_name,
@@ -80,12 +101,12 @@ def make_smolvla_pre_post_processors(
         NormalizerProcessorStep(
             features={**config.input_features, **config.output_features},
             norm_map=config.normalization_mapping,
-            stats=dataset_stats,
+            stats=normalization_stats,
         ),
     ]
     output_steps = [
         UnnormalizerProcessorStep(
-            features=config.output_features, norm_map=config.normalization_mapping, stats=dataset_stats
+            features=config.output_features, norm_map=config.normalization_mapping, stats=normalization_stats
         ),
         DeviceProcessorStep(device="cpu"),
     ]
@@ -101,6 +122,39 @@ def make_smolvla_pre_post_processors(
             to_output=transition_to_policy_action,
         ),
     )
+
+
+@dataclass
+@ProcessorStepRegistry.register(name="smolvla_relative_eef_chunk")
+class SmolVLARelativeEEFChunkProcessor(ProcessorStep):
+    """Convert an absolute EEF action chunk relative to its current EEF state."""
+
+    def __call__(self, transition):
+        action = transition.get(TransitionKey.ACTION)
+        observation = transition.get(TransitionKey.OBSERVATION)
+        if action is None or observation is None or "observation.state" not in observation:
+            return transition
+        if not isinstance(action, torch.Tensor):
+            raise ValueError(f"relative EEF action must be a tensor, got {type(action)}")
+        state = observation["observation.state"]
+        if not isinstance(state, torch.Tensor):
+            raise ValueError(f"relative EEF state must be a tensor, got {type(state)}")
+        unbatched = action.ndim == 2
+        actions = action.unsqueeze(0) if unbatched else action
+        states = state.unsqueeze(0) if state.ndim == 1 else state
+        if actions.ndim != 3 or actions.shape[-1] != 7 or states.shape[-1] != 7:
+            raise ValueError(f"expected EEF state/action (...,7), got {states.shape}/{actions.shape}")
+        converted = np.stack(
+            [chunk_to_relative(s, a) for s, a in zip(states.detach().cpu().numpy(), actions.detach().cpu().numpy())]
+        )
+        new_transition = transition.copy()
+        new_transition[TransitionKey.ACTION] = torch.as_tensor(
+            converted, dtype=action.dtype, device=action.device
+        )[0] if unbatched else torch.as_tensor(converted, dtype=action.dtype, device=action.device)
+        return new_transition
+
+    def transform_features(self, features):
+        return features
 
 
 @ProcessorStepRegistry.register(name="smolvla_new_line_processor")

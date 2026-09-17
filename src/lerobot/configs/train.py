@@ -47,6 +47,10 @@ class TrainPipelineConfig(HubMixin):
     # Note that when resuming a run, the default behavior is to use the configuration from the checkpoint,
     # regardless of what's provided with the training command at the time of resumption.
     resume: bool = False
+    # Restore the scheduler state together with the model/optimizer state on
+    # resume. Disable this to keep optimizer moments while starting a newly
+    # configured learning-rate schedule from its first step.
+    resume_scheduler: bool = True
     # `seed` is used for training (eg: model initialization, dataset shuffling)
     # AND for the evaluation environments.
     seed: int | None = 1000
@@ -147,6 +151,7 @@ class TrainPipelineConfig(HubMixin):
                 self.rabc_progress_path = str(Path(self.dataset.root) / "sarm_progress.parquet")
             else:
                 self.rabc_progress_path = f"hf://datasets/{repo_id}/sarm_progress.parquet"
+
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:

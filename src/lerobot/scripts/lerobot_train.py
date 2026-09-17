@@ -30,6 +30,7 @@ from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.factory import make_dataset
 from lerobot.datasets.sampler import EpisodeAwareSampler
+from lerobot.datasets.transforms import ImageTransforms
 from lerobot.datasets.utils import cycle
 from lerobot.envs.factory import make_env, make_env_pre_post_processors
 from lerobot.envs.utils import close_envs
@@ -54,6 +55,20 @@ from lerobot.utils.utils import (
     init_logging,
     inside_slurm,
 )
+
+
+def apply_gpu_image_transforms(batch: dict[str, Any], transforms: ImageTransforms | None) -> dict[str, Any]:
+    """Apply training-only torchvision v2 augmentation after CUDA transfer."""
+    if transforms is None:
+        return batch
+    for key, value in batch.items():
+        # The batch also carries one-dimensional `*_is_pad` tensors with the
+        # same prefix. Only actual image tensors have channel/height/width.
+        if key.startswith("observation.images.") and isinstance(value, torch.Tensor) and value.ndim >= 3:
+            if not value.is_cuda:
+                raise RuntimeError(f"GPU image augmentation received CPU tensor for {key}")
+            batch[key] = transforms(value)
+    return batch
 
 
 def update_policy(
@@ -248,18 +263,33 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # Wait for all processes to finish policy creation before continuing
     accelerator.wait_for_everyone()
 
-    # Create processors - only provide dataset_stats if not resuming from saved processors
-    processor_kwargs = {}
+    # Fresh policies receive statistics from the active dataset. A continued
+    # relative-EEF checkpoint is different: its saved processor defines the
+    # model's input/action coordinate contract and must be inherited exactly.
+    # Replacing those statistics during a targeted fine-tune would silently
+    # change the coordinates seen by the existing weights.
+    processor_kwargs = {"dataset_stats": dataset.meta.stats}
     postprocessor_kwargs = {}
-    if (cfg.policy.pretrained_path and not cfg.resume) or not cfg.policy.pretrained_path:
-        # Only provide dataset_stats when not resuming from saved processor state
-        processor_kwargs["dataset_stats"] = dataset.meta.stats
 
+    # `make_pre_post_processors` handles the two valid relative-EEF cases:
+    # a base/absolute checkpoint has no relative step, so it builds one from
+    # active dataset statistics; an existing relative checkpoint loads its
+    # complete saved processor (including the original normalizer statistics).
+    uses_relative_eef_actions = (
+        cfg.policy.type == "smolvla"
+        and bool(getattr(cfg.policy, "use_relative_eef_actions", False))
+    )
+    processor_pretrained_path = cfg.policy.pretrained_path
+    if uses_relative_eef_actions and cfg.policy.pretrained_path is not None and is_main_process:
+        logging.info(
+            "Relative-EEF continued training inherits the saved checkpoint processor "
+            "and its normalization statistics."
+        )
     # For SARM, always provide dataset_meta for progress normalization
     if cfg.policy.type == "sarm":
         processor_kwargs["dataset_meta"] = dataset.meta
 
-    if cfg.policy.pretrained_path is not None:
+    if cfg.policy.pretrained_path is not None and not uses_relative_eef_actions:
         processor_kwargs["preprocessor_overrides"] = {
             "device_processor": {"device": device.type},
             "normalizer_processor": {
@@ -281,10 +311,18 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,
-        pretrained_path=cfg.policy.pretrained_path,
+        pretrained_path=processor_pretrained_path,
         **processor_kwargs,
         **postprocessor_kwargs,
     )
+
+    gpu_image_transforms = None
+    if cfg.dataset.image_transforms.enable and cfg.dataset.image_transforms.use_gpu:
+        if device.type != "cuda":
+            raise ValueError("dataset.image_transforms.use_gpu requires a CUDA training device")
+        gpu_image_transforms = ImageTransforms(cfg.dataset.image_transforms).to(device)
+        if is_main_process:
+            logging.info("Applying image augmentation on CUDA after batch transfer.")
 
     if is_main_process:
         logging.info("Creating optimizer and scheduler")
@@ -316,7 +354,25 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     step = 0  # number of policy updates (forward + backward + optim)
 
     if cfg.resume:
-        step, optimizer, lr_scheduler = load_training_state(cfg.checkpoint_path, optimizer, lr_scheduler)
+        checkpoint_scheduler = lr_scheduler if cfg.resume_scheduler else None
+        step, optimizer, restored_scheduler = load_training_state(
+            cfg.checkpoint_path, optimizer, checkpoint_scheduler
+        )
+        if cfg.resume_scheduler:
+            lr_scheduler = restored_scheduler
+        elif lr_scheduler is not None:
+            # Loading Adam state restores the old param-group learning rates.
+            # Keep its moments, but reset every group to the newly configured
+            # scheduler base rate before the first resumed optimizer update.
+            for group, base_lr in zip(optimizer.param_groups, lr_scheduler.base_lrs, strict=True):
+                group["lr"] = base_lr
+                group["initial_lr"] = base_lr
+            if is_main_process:
+                logging.info(
+                    "Resumed model and optimizer at step %d with a reset LR scheduler "
+                    "(scheduler state was not restored).",
+                    step,
+                )
 
     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     num_total_params = sum(p.numel() for p in policy.parameters())
@@ -408,6 +464,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         start_time = time.perf_counter()
         batch = next(dl_iter)
         batch = preprocessor(batch)
+        batch = apply_gpu_image_transforms(batch, gpu_image_transforms)
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
         train_tracker, output_dict = update_policy(

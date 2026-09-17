@@ -1,0 +1,6 @@
+layout {
+    pane name="smolvla-il-chunk30-20k" cwd="/media/fuxin/59b726b5-293a-4235-af97-1e18589c462e/lerobot0_4_0/lerobot" command="bash" {
+        args "-lc" "scripts/train_cobot_magic_smolvla_il_chunk30_20k.sh"
+        close_on_exit false
+    }
+}

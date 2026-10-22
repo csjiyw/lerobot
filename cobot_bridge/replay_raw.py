@@ -18,7 +18,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-from .client import BridgeError, CobotBridgeClient
+from .client import BridgeError, CobotBridgeClient, request_robot_safe_stop
 from .record_raw import FORMAT
 from .remote_robot import CobotMagicRemoteRobot
 
@@ -508,10 +508,8 @@ def main() -> None:
         except KeyboardInterrupt:
             LOG.warning("replay stopped by operator")
         finally:
-            try:
-                robot.set_output(False)
-            finally:
-                robot.request_mode(SAFE)
+            safety = request_robot_safe_stop(args.endpoint)
+            LOG.info("replay exit safety request: %s", safety)
 
 
 if __name__ == "__main__":

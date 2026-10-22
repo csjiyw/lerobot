@@ -1,8 +1,13 @@
+import json
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
 
 from cobot_bridge.rlt_online import (
+    DecisionTakeoverGate,
+    _actor_control_allowed,
     _is_mode2_intervention_boundary,
     _raise_for_rejected_action,
     _requested_outcome,
@@ -76,3 +81,82 @@ def test_bridge_control_transition_rejection_is_typed():
 def test_non_control_rejection_remains_fatal():
     with pytest.raises(RuntimeError, match="invalid_action"):
         _raise_for_rejected_action("action chunk", {"accepted": False, "reason": "invalid_action"})
+
+
+def test_decision_gate_waits_for_complete_reference_chunks():
+    gate = DecisionTakeoverGate.__new__(DecisionTakeoverGate)
+    gate._needed = 2
+    gate._seen = 0
+    gate.latched = False
+    gate.last_position = None
+
+    assert gate.update(None) is False
+    assert gate.update(None) is False
+    assert gate.update(None) is True
+    assert gate.update(None) is True
+
+
+def test_decision_gate_opens_after_eight_reference_chunks():
+    gate = DecisionTakeoverGate.__new__(DecisionTakeoverGate)
+    gate._needed = 8
+    gate._seen = 0
+    gate.latched = False
+    gate.last_position = None
+
+    assert all(gate.update(None) is False for _ in range(8))
+    assert gate.update(None) is True
+
+
+def test_actor_decision_budget_stops_after_configured_exposure():
+    assert _actor_control_allowed(True, 0, 1)
+    assert not _actor_control_allowed(True, 1, 1)
+    assert _actor_control_allowed(True, 100, 0)
+    assert not _actor_control_allowed(False, 0, 3)
+
+
+def test_aborted_episode_is_quarantined_without_orphans(tmp_path):
+    from argparse import Namespace
+
+    from cobot_bridge.rlt_online import _quarantine_aborted_episode
+
+    batch = tmp_path / "masterpiece_online_v7"
+    batch.mkdir()
+    stem = "rlt_actor_mode2_20260918_181500_123456"
+    raw = batch / f"{stem}.raw.h5"
+    args = Namespace(
+        raw_output=raw,
+        decision_output=batch / f"{stem}.decisions.h5",
+        replay_output=tmp_path / "replay" / f"{stem}.npz",
+        result_file=batch / f"{stem}.raw.h5.result",
+        recorder_ready_file=batch / f"{stem}.raw.h5.ready",
+    )
+    leftovers = [
+        raw,
+        raw.with_name(raw.name + ".partial"),
+        args.recorder_ready_file,
+        Path(f"{raw}.phases.jsonl"),
+        args.decision_output,
+        args.replay_output,
+        args.result_file,
+    ]
+    for path in leftovers:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x")
+
+    _quarantine_aborted_episode(args)
+
+    assert list(batch.rglob("*.h5")) == [], "the bin must stay invisible to raw scans"
+    assert list(batch.glob("*.phases.jsonl")) == []
+    bin_dir = batch / "_discarded" / stem
+    moved = sorted(path.name for path in bin_dir.iterdir())
+    assert moved == [
+        "abort_manifest.json",
+        f"{stem}.decisions.h5.aborted",
+        f"{stem}.npz.aborted",
+        f"{stem}.raw.h5.aborted",
+        f"{stem}.raw.h5.partial.aborted",
+        f"{stem}.raw.h5.phases.jsonl.aborted",
+        f"{stem}.raw.h5.ready.aborted",
+        f"{stem}.raw.h5.result.aborted",
+    ]
+    assert json.loads((bin_dir / "abort_manifest.json").read_text())["episode"] == stem

@@ -66,12 +66,14 @@ class SmolVLMWithExpertModel(nn.Module):
         load_vlm_weights: bool = True,
         train_expert_only: bool = True,
         freeze_vision_encoder: bool = False,
+        unfreeze_vision_last_blocks: int = 0,
         attention_mode: str = "self_attn",
         num_expert_layers: int = -1,
         num_vlm_layers: int = -1,
         self_attn_every_n_layers: int = -1,
         expert_width_multiplier: float = 0.5,
         device: str = "auto",
+        use_sdpa: bool = False,
     ):
         super().__init__()
         # Reconstruction/evaluation may run on a machine without egress even
@@ -135,8 +137,12 @@ class SmolVLMWithExpertModel(nn.Module):
         self.num_key_value_heads = self.config.text_config.num_key_value_heads
 
         self.freeze_vision_encoder = freeze_vision_encoder
+        self.unfreeze_vision_last_blocks = unfreeze_vision_last_blocks
         self.train_expert_only = train_expert_only
         self.attention_mode = attention_mode
+        self.use_sdpa = use_sdpa
+        # dtype for the SDPA attention compute; eager always uses fp32
+        self.sdpa_dtype = torch.float32
         self.expert_hidden_size = lm_expert_config.hidden_size
         self.set_requires_grad()
 
@@ -158,6 +164,17 @@ class SmolVLMWithExpertModel(nn.Module):
             self.get_vlm_model().vision_model.eval()
             for params in self.get_vlm_model().vision_model.parameters():
                 params.requires_grad = False
+            if self.unfreeze_vision_last_blocks > 0:
+                layers = None
+                for _n, mod in self.get_vlm_model().vision_model.named_modules():
+                    if isinstance(mod, torch.nn.ModuleList) and len(mod) >= 2 * self.unfreeze_vision_last_blocks:
+                        layers = mod
+                        break
+                if layers is None:
+                    raise RuntimeError("no vision transformer layer list found for half-unfreeze")
+                for block in list(layers)[-self.unfreeze_vision_last_blocks:]:
+                    for params in block.parameters():
+                        params.requires_grad = True
         for params in self.lm_expert.parameters():
             params.requires_grad = True
 
@@ -466,7 +483,9 @@ class SmolVLMWithExpertModel(nn.Module):
                     out_emb = layer.self_attn.o_proj(att_out)
 
                     out_emb += hidden_states
-                    after_first_residual = out_emb.clone()
+                    # No clone needed: the residual source is never mutated in-place
+                    # after this point (post_attention_layernorm/mlp return new tensors).
+                    after_first_residual = out_emb
 
                     out_emb = layer.post_attention_layernorm(out_emb)
                     out_emb = layer.mlp(out_emb)
@@ -492,8 +511,33 @@ class SmolVLMWithExpertModel(nn.Module):
         return outputs_embeds, past_key_values
 
     def get_attention_interface(self):
-        attention_interface = self.eager_attention_forward
-        return attention_interface
+        if getattr(self, "use_sdpa", False):
+            return self.sdpa_attention_forward
+        return self.eager_attention_forward
+
+    def sdpa_attention_forward(
+        self, attention_mask, batch_size, head_dim, query_states, key_states, value_states
+    ):
+        """SDPA-based attention replacing the eager path.
+
+        Compute dtype is ``self.sdpa_dtype`` (float32 matches eager's
+        QK^T/softmax precision within ~1e-3 under bf16 autocast; bfloat16 is
+        the faster variant). Never materializes the (B,H,L,L) attention
+        matrix (fused softmax) and handles GQA natively (no expansion copy).
+        """
+        num_att_heads = self.num_attention_heads
+        dtype = self.sdpa_dtype
+        # B,L,H,D -> B,H,L,D
+        q = query_states.transpose(1, 2).to(dtype=dtype)
+        k = key_states.transpose(1, 2).to(dtype=dtype)
+        v = value_states.transpose(1, 2).to(dtype=dtype)
+        # bool (B, Lq, Lkv) mask -> (B,1,Lq,Lkv); True = attend (eager convention)
+        attn_mask = attention_mask[:, None, :, :] if attention_mask is not None else None
+        out = nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask, enable_gqa=True
+        )
+        # B,H,L,D -> B,L,H*D
+        return out.transpose(1, 2).reshape(batch_size, -1, num_att_heads * head_dim)
 
     def eager_attention_forward(
         self, attention_mask, batch_size, head_dim, query_states, key_states, value_states

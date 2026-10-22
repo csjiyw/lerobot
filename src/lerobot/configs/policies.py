@@ -83,6 +83,16 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
     # saved using `Policy.save_pretrained`. If not provided, the policy is initialized from scratch.
     pretrained_path: Path | None = None
 
+    def get(self, key: str, default=None):
+        """Dict-style access used by third-party tooling (e.g. PEFT) to peek at config fields."""
+        return getattr(self, key, default)
+
+    def __contains__(self, key) -> bool:
+        return hasattr(self, key)
+
+    def __getitem__(self, key):
+        return getattr(self, key)
+
     def __post_init__(self) -> None:
         if not self.device or not is_torch_device_available(self.device):
             auto_device = auto_select_torch_device()

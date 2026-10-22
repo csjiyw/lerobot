@@ -35,6 +35,9 @@ class DatasetConfig:
     use_imagenet_stats: bool = True
     video_backend: str = field(default_factory=get_safe_default_codec)
     streaming: bool = False
+    # v4: JSON file mapping sampler-group -> weight (meta/sampler_weights.json);
+    # episode->group labels are read from meta/env_groups.json next to it.
+    group_weights_json: str | None = None
 
 
 @dataclass

@@ -176,6 +176,10 @@ class ImageTransformsConfig:
     # Keep augmentation out of DataLoader workers and apply it after the batch
     # reaches CUDA in the training loop. This never affects policy inference.
     use_gpu: bool = False
+    # When set (e.g. [256, 256] = [width, height]), the resize+pad step is
+    # applied in the DataLoader worker (CPU, parallel) so the batch transfers
+    # the small tensor to the GPU instead of the full-resolution one.
+    pre_resize: list[int] | None = None
     # This is the maximum number of transforms (sampled from these below) that will be applied to each frame.
     # It's an integer in the interval [1, number_of_available_transforms].
     max_num_transforms: int = 3
@@ -261,3 +265,38 @@ class ImageTransforms(Transform):
 
     def forward(self, *inputs: Any) -> Any:
         return self.tf(*inputs)
+
+
+class ResizeWithPad:
+    """CPU-side resize-then-pad for image tensors (b, c, h, w).
+
+    Mirrors ``policies.smolvla.modeling_smolvla.resize_with_pad`` (bilinear,
+    align_corners=False, pad on left/top with ``pad_value``) so it can be run
+    inside the DataLoader worker: the batch then ships the small tensor to the
+    GPU instead of the full-resolution one.
+    """
+
+    def __init__(self, width: int, height: int, pad_value: float = 0.0) -> None:
+        self.width = width
+        self.height = height
+        self.pad_value = pad_value
+
+    def __call__(self, img: torch.Tensor) -> torch.Tensor:
+        if img.ndim not in (3, 4):
+            raise ValueError(f"(c,h,w) or (b,c,h,w) expected, but {img.shape}")
+        squeeze = img.ndim == 3
+        if squeeze:
+            img = img.unsqueeze(0)
+        cur_height, cur_width = img.shape[2:]
+        ratio = max(cur_width / self.width, cur_height / self.height)
+        resized_height = int(cur_height / ratio)
+        resized_width = int(cur_width / ratio)
+        resized_img = torch.nn.functional.interpolate(
+            img, size=(resized_height, resized_width), mode="bilinear", align_corners=False
+        )
+        pad_height = max(0, int(self.height - resized_height))
+        pad_width = max(0, int(self.width - resized_width))
+        padded_img = torch.nn.functional.pad(
+            resized_img, (pad_width, 0, pad_height, 0), value=self.pad_value
+        )
+        return padded_img.squeeze(0) if squeeze else padded_img

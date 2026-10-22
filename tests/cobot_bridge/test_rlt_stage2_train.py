@@ -2,6 +2,7 @@ import json
 from dataclasses import asdict
 
 import numpy as np
+import pytest
 import torch
 
 from cobot_bridge.rlt_stage2_data import (
@@ -13,7 +14,10 @@ from cobot_bridge.rlt_stage2_data import (
 )
 from cobot_bridge.rlt_stage2_train import (
     _actor_bc_target_and_mask,
+    _assert_reference_reachable,
+    _derive_actor_action_scale,
     _masked_action_mse,
+    _reachable_bc_target,
     _sample_balanced_outcome_indices,
     _sample_balanced_episode_indices,
     discover_replay_bundles,
@@ -145,6 +149,8 @@ def test_stage2_trainer_publishes_and_resumes_checkpoint(tmp_path):
     assert checkpoint["actor_output_semantics"] == ACTOR_OUTPUT_SEMANTICS
     assert checkpoint["action_chunk_timebase"] == ACTION_CHUNK_TIMEBASE
     assert len(checkpoint["actor_action_scale"]) == 3
+    assert checkpoint["grad_clip_norm"] == 1.0
+    assert checkpoint["ref_anchor_weight"] == 0.5
     assert checkpoint["training_phase"] == "actor"
     assert checkpoint["ready_for_online"] is True
     assert "warmup_updates" not in checkpoint
@@ -292,6 +298,52 @@ def test_actor_bc_empty_mask_has_differentiable_zero_loss():
     loss.backward()
     assert loss.item() == 0.0
     assert torch.equal(predicted.grad, torch.zeros_like(predicted))
+
+
+def test_residual_bc_target_is_projected_into_reachable_box():
+    reference = torch.zeros(1, 2, 3)
+    target = torch.tensor([[[2.0, -2.0, 0.25], [0.5, -0.5, 0.0]]])
+    scale = torch.tensor([4.0, 2.0, 1.0])
+
+    reachable = _reachable_bc_target(
+        target,
+        reference,
+        scale,
+        output_semantics=ACTOR_OUTPUT_SEMANTICS,
+        residual_scale=0.25,
+    )
+
+    assert torch.equal(
+        reachable,
+        torch.tensor([[[1.0, -0.5, 0.25], [0.5, -0.5, 0.0]]]),
+    )
+
+
+def _reachability_arrays(peak: float):
+    dim = 3
+    ref = np.full((2, 4, dim), peak, dtype=np.float32)
+    return {
+        "ref_actions": ref,
+        "next_ref_actions": np.zeros_like(ref),
+        "actions": np.zeros_like(ref),
+    }
+
+
+def test_reference_reachability_rejects_a_truncating_scale():
+    arrays = _reachability_arrays(peak=4.0)
+    narrow = np.array([2.6, 5.0, 5.0], dtype=np.float32)
+
+    with pytest.raises(ValueError, match="truncates the replay reference") as error:
+        _assert_reference_reachable(arrays, narrow)
+
+    assert "dim 0: |action| up to 4.000 > scale 2.600" in str(error.value)
+    assert "--actor-action-scale" in str(error.value)
+    _assert_reference_reachable(arrays, narrow, allow_clipped=True)
+
+
+def test_reference_reachability_accepts_the_derived_scale():
+    arrays = _reachability_arrays(peak=4.0)
+    _assert_reference_reachable(arrays, _derive_actor_action_scale(arrays))
 
 
 def test_heldout_il_regression_is_diagnostic_only(tmp_path, monkeypatch):

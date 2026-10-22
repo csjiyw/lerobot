@@ -415,28 +415,30 @@ class SmolVLAPolicy(PreTrainedPolicy):
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
         actions = self.prepare_action(batch)
         actions_is_pad = batch.get("action_is_pad")
+        # Diagnostics are stored as lazy (detached) tensors to avoid the extra
+        # GPU->CPU syncs that .item() would force on every training step.
         loss_dict = {}
         losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
-        loss_dict["losses_after_forward"] = losses.clone().mean().item()
+        loss_dict["losses_after_forward"] = losses.detach().mean()
 
         if actions_is_pad is not None:
             in_episode_bound = ~actions_is_pad
             losses = losses * in_episode_bound.unsqueeze(-1)
-            loss_dict["losses_after_in_ep_bound"] = losses.clone().mean().item()
+            loss_dict["losses_after_in_ep_bound"] = losses.detach().mean()
 
         # Remove padding
         losses = losses[:, :, : self.config.max_action_dim]
-        loss_dict["losses_after_rm_padding"] = losses.clone().mean().item()
+        loss_dict["losses_after_rm_padding"] = losses.detach().mean()
 
         if reduction == "none":
             # Return per-sample losses (B,) by averaging over time and action dims
             per_sample_loss = losses.mean(dim=(1, 2))
-            loss_dict["loss"] = per_sample_loss.mean().item()
+            loss_dict["loss"] = per_sample_loss.detach().mean()
             return per_sample_loss, loss_dict
         else:
             # Default: return scalar mean loss
             loss = losses.mean()
-            loss_dict["loss"] = loss.item()
+            loss_dict["loss"] = loss.detach()
             return loss, loss_dict
 
     def forward_with_rlt_prefix(
@@ -626,6 +628,7 @@ class VLAFlowMatching(nn.Module):
         self.vlm_with_expert = SmolVLMWithExpertModel(
             model_id=self.config.vlm_model_name,
             freeze_vision_encoder=self.config.freeze_vision_encoder,
+            unfreeze_vision_last_blocks=self.config.unfreeze_vision_last_blocks,
             train_expert_only=self.config.train_expert_only,
             load_vlm_weights=self.config.load_vlm_weights,
             attention_mode=self.config.attention_mode,
@@ -634,6 +637,7 @@ class VLAFlowMatching(nn.Module):
             self_attn_every_n_layers=self.config.self_attn_every_n_layers,
             expert_width_multiplier=self.config.expert_width_multiplier,
             device=self.config.device if self.config.device is not None else "auto",
+            use_sdpa=self.config.use_sdpa,
         )
         self.state_proj = nn.Linear(
             self.config.max_state_dim, self.vlm_with_expert.config.text_config.hidden_size
@@ -698,10 +702,22 @@ class VLAFlowMatching(nn.Module):
         embs = []
         pad_masks = []
         att_masks = []
+        camera_keep = None
+        if self.training and self.config.camera_dropout > 0.0 and len(images) > 1:
+            import random as _random
+
+            n_cams = len(images)
+            bsize_c = images[0].shape[0]
+            camera_keep = torch.rand(bsize_c, n_cams, device=images[0].device) >= self.config.camera_dropout
+            for b in range(bsize_c):
+                if not camera_keep[b].any():
+                    camera_keep[b, _random.randrange(n_cams)] = True
         for _img_idx, (
             img,
             img_mask,
         ) in enumerate(zip(images, img_masks, strict=False)):
+            if camera_keep is not None:
+                img = img * camera_keep[:, _img_idx].to(dtype=img.dtype, device=img.device).view(-1, 1, 1, 1)
             if self.add_image_special_tokens:
                 image_start_token = (
                     self.vlm_with_expert.embed_language_tokens(
@@ -756,8 +772,20 @@ class VLAFlowMatching(nn.Module):
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
 
+        # Apply fixed observation-state masking after dataset relative-EEF
+        # transforms and normalization. This keeps action targets anchored to
+        # the real full pose while hiding selected state coordinates from the
+        # network in both training and inference.
+        if self.config.state_mask_indices:
+            state = state.clone()
+            masked_indices = torch.as_tensor(
+                self.config.state_mask_indices, dtype=torch.long, device=state.device
+            )
+            state.index_fill_(-1, masked_indices, 0.0)
         state_emb = self.state_proj(state)
         state_emb = state_emb[:, None, :] if state_emb.ndim == 2 else state_emb
+        if self.training and self.config.state_noise_std > 0.0:
+            state_emb = state_emb + torch.randn_like(state_emb) * self.config.state_noise_std
         state_emb, _ = _drop_state_features(
             state_emb, probability=self.config.state_dropout, training=self.training
         )

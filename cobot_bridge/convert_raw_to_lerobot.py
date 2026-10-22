@@ -273,8 +273,15 @@ def trim_episode_bounds(
     joint_tolerance: float,
     gripper_tolerance: float,
     settle_seconds: float,
+    keep_final_steady: bool = False,
+    head_tolerance: float = 0.02,
 ) -> tuple[int, int, dict[str, Any]]:
-    """Return [start, end) after removing IL wait time and stationary holds."""
+    """Return [start, end) after removing IL wait time and stationary holds.
+
+    With ``keep_final_steady=True`` only the head (initial wait + initial
+    steady) is removed; the tail — including the return-to-ready motion and
+    any final steady hold — is kept verbatim (去头不去尾).
+    """
 
     timestamps_ns = np.asarray(timestamps_ns, dtype=np.int64)
     trajectory = np.asarray(trajectory, dtype=np.float64)
@@ -296,6 +303,37 @@ def trim_episode_bounds(
             raise ValueError("IL episode has no Teach-active demonstration frames")
         base_start = int(teach_indices[0])
         base_end = int(teach_indices[-1]) + 1
+
+    if keep_final_steady:
+        # Head-only trim (去头不去尾): never cut the tail.  The tail still
+        # provides termination supervision (return-to-ready + final steady).
+        # Head departure uses a cumulative L2 distance with its own tolerance
+        # (default 2 cm) so slow sub-1 cm drift at the start is still removed,
+        # matching the v3 spec in NOTAIL_REBUILD_RECORD.md §4.3.
+        segment = trajectory[base_start:base_end]
+        initial_pose = np.median(segment[: min(3, len(segment))], axis=0)
+        departed_initial = np.flatnonzero(
+            np.linalg.norm(segment - initial_pose, axis=1) > head_tolerance
+        )
+        start = base_start
+        if base_end - base_start >= 3 and len(departed_initial):
+            first_motion = base_start + int(departed_initial[0])
+            settle_ns = int(round(settle_seconds * 1e9))
+            start_time = max(int(timestamps_ns[base_start]), int(timestamps_ns[first_motion]) - settle_ns)
+            start = max(base_start, int(np.searchsorted(timestamps_ns, start_time, side="left")))
+            start = min(start, base_end - 2)
+        seconds = timestamps_ns.astype(np.float64) / 1e9
+        info: dict[str, Any] = {
+            "original_frames": len(timestamps_ns),
+            "trimmed_frames": base_end - start,
+            "start_index": start,
+            "end_index_exclusive": base_end,
+            "initial_wait_removed_s": float(seconds[base_start] - seconds[0]),
+            "initial_steady_removed_s": float(seconds[start] - seconds[base_start]),
+            "final_steady_removed_s": 0.0,
+            "post_teach_removed_s": 0.0,
+        }
+        return start, base_end, info
 
     segment = trajectory[base_start:base_end]
     tolerance = np.asarray([joint_tolerance] * 6 + [gripper_tolerance])
@@ -412,9 +450,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vcodec", default="h264")
     parser.add_argument("--image-writer-threads", type=int, default=4)
     parser.add_argument("--trim-stationary-holds", action="store_true")
+    parser.add_argument(
+        "--keep-final-steady",
+        action="store_true",
+        help="head-only trim (去头不去尾): keep the tail (return-to-ready + final steady) instead of trimming it",
+    )
     parser.add_argument("--trim-joint-tolerance", type=float, default=0.01)
     parser.add_argument("--trim-gripper-tolerance", type=float, default=0.002)
     parser.add_argument("--trim-settle-seconds", type=float, default=0.5)
+    parser.add_argument(
+        "--trim-head-tolerance",
+        type=float,
+        default=0.02,
+        help="L2 (cumulative) distance for head-only trim departure detection (default 0.02 = 2 cm)",
+    )
     return parser
 
 
@@ -453,9 +502,11 @@ def main() -> None:
             else None
         ),
         "trim_stationary_holds": args.trim_stationary_holds,
+        "keep_final_steady": args.keep_final_steady,
         "trim_joint_tolerance": args.trim_joint_tolerance,
         "trim_gripper_tolerance": args.trim_gripper_tolerance,
         "trim_settle_seconds": args.trim_settle_seconds,
+        "trim_head_tolerance": args.trim_head_tolerance,
         "episodes": [],
     }
     try:
@@ -517,6 +568,8 @@ def main() -> None:
                         joint_tolerance=args.trim_joint_tolerance,
                         gripper_tolerance=args.trim_gripper_tolerance,
                         settle_seconds=args.trim_settle_seconds,
+                        keep_final_steady=args.keep_final_steady,
+                        head_tolerance=args.trim_head_tolerance,
                     )
                 else:
                     start, end = 0, count

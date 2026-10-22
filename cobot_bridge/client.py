@@ -178,3 +178,28 @@ class CobotBridgeClient:
             action_space=str(action_space),
         )
         return dict(result or {})
+
+
+def request_robot_safe_stop(endpoint: str, *, timeout_s: float = 1.5) -> dict[str, Any]:
+    """Best-effort output-off + SAFE using a fresh socket for each request.
+
+    Stop buttons may interrupt a runner while its REQ socket is waiting for a
+    response. A new short-lived socket avoids inheriting that REQ state and
+    disables physical output before the runner is signalled to exit.
+    """
+
+    results: dict[str, Any] = {}
+    errors: list[str] = []
+    for key, action in (("output_disabled", "output"), ("mode_safe", "safe")):
+        try:
+            with CobotBridgeClient(endpoint, timeout_s=timeout_s) as client:
+                response = client.set_output(False) if action == "output" else client.set_mode(0)
+            results[key] = response
+            if not response.get("accepted", False):
+                errors.append(f"{key} rejected: {response}")
+        except Exception as exc:  # Keep trying the independent SAFE request.
+            errors.append(f"{key} failed: {type(exc).__name__}: {exc}")
+    results["safe"] = not errors
+    if errors:
+        results["errors"] = errors
+    return results

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import signal
 import subprocess
 import sys
@@ -105,17 +106,7 @@ def _raise_for_rejected_action(label: str, result: dict) -> None:
 
 
 class DecisionTakeoverGate:
-    """Latch actor takeover once this many policy decisions have elapsed.
-
-    The spatial insertion-box gate was inherited from the older task layout
-    and its box does not cover this bench's grasp/carry/insert workspace, so
-    it never latched and the actor never drove. With 30-step chunks at 0.5x
-    rollout each decision spans 60 raw frames, so the default of 13 decisions
-    hands control to the actor at ~frame 780 -- exactly the training window
-    start of the remote-aligned actor recipe (grasp-close events cluster at
-    frames 750-880; the human-taught close/carry rows past 780 are actor BC
-    targets, so the actor knows how to finish an unclosed grasp).
-    """
+    """Latch actor takeover after this many reference decisions have executed."""
 
     def __init__(self, decisions: int) -> None:
         self._needed = max(1, int(decisions))
@@ -138,10 +129,27 @@ class DecisionTakeoverGate:
             )["gripper_center"][0][0].copy()
         if self.latched:
             return True
-        self._seen += 1
         if self._seen >= self._needed:
             self.latched = True
-        return self.latched
+            return True
+        self._seen += 1
+        return False
+
+
+def _actor_control_allowed(
+    gate_open: bool,
+    actor_decisions_executed: int,
+    actor_max_decisions: int,
+) -> bool:
+    """Apply an optional finite Actor exposure budget after the phase gate."""
+
+    return bool(
+        gate_open
+        and (
+            actor_max_decisions <= 0
+            or actor_decisions_executed < actor_max_decisions
+        )
+    )
 
 
 def resample_action_chunk(actions: np.ndarray, speed_scale: float) -> np.ndarray:
@@ -286,6 +294,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--actor-max-decisions",
+        type=int,
+        choices=(0, 1, 2, 3),
+        default=0,
+        help=(
+            "Maximum number of Actor chunks physically executed after takeover. "
+            "1-3 enables bounded online calibration; 0 keeps unlimited takeover."
+        ),
+    )
+    parser.add_argument(
         "--actor-exploration-std", type=float, default=DEFAULT_ACTOR_EXPLORATION_STD
     )
     parser.add_argument(
@@ -327,7 +345,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ref-anchor-weight",
         type=float,
-        default=0.0,
+        default=0.5,
         help="Weight of the reference-anchor (actor -> VLA reference) loss term.",
     )
     parser.add_argument(
@@ -501,6 +519,71 @@ def _launch_post_episode(args) -> int | None:
     return process.pid
 
 
+ABORTED_BIN = "_discarded"
+ABORTED_SUFFIX = ".aborted"
+
+
+def _quarantine_aborted_episode(args) -> None:
+    """Move every artifact of an aborted episode into ``<batch>/_discarded/<stem>/``.
+
+    The raw recorder and the phase sidecar are written while the rollout runs, so
+    an episode discarded before its first action chunk still leaves files behind.
+    Unlinking them threw away data that is usually fully recoverable, and left a
+    lone ``.phases.jsonl`` in the batch directory.  Every moved file gains an
+    ``.aborted`` suffix, which is what keeps the bin invisible to the
+    ``*.raw.h5`` / ``rglob("*.h5")`` scans that would otherwise offer a discarded
+    episode for rebuilding.
+    """
+
+    stem = args.raw_output.name.removesuffix(".raw.h5")
+    bin_dir = args.raw_output.parent / ABORTED_BIN / (stem or args.raw_output.stem)
+    artifacts = [
+        args.raw_output,
+        args.raw_output.with_name(args.raw_output.name + ".partial"),
+        args.recorder_ready_file,
+        Path(f"{args.raw_output}.phases.jsonl"),
+        args.decision_output,
+        args.decision_output.with_name(args.decision_output.name + ".q_select.json"),
+        args.replay_output,
+        args.replay_output.with_suffix(args.replay_output.suffix + ".json"),
+        args.result_file,
+    ]
+    moved: dict[str, int] = {}
+    quarantine = True
+    try:
+        bin_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        LOG.exception("cannot create %s; deleting aborted episode files instead", bin_dir)
+        quarantine = False
+    for source in artifacts:
+        if not source.is_file():
+            continue
+        if quarantine:
+            target = bin_dir / (source.name + ABORTED_SUFFIX)
+            try:
+                os.replace(source, target)
+                moved[target.name] = target.stat().st_size
+                continue
+            except OSError:
+                LOG.exception("failed to quarantine %s; deleting", source)
+        source.unlink(missing_ok=True)
+    if moved:
+        (bin_dir / "abort_manifest.json").write_text(
+            json.dumps(
+                {"episode": stem, "aborted_at_ns": time.time_ns(), "files": moved},
+                indent=1,
+                sort_keys=True,
+            )
+        )
+    LOG.info(
+        "episode aborted; %d file(s) %s (%.1f MiB, restore by dropping the %s suffix)",
+        len(moved),
+        f"moved to {bin_dir}" if moved else "deleted",
+        sum(moved.values()) / 1e6,
+        ABORTED_SUFFIX,
+    )
+
+
 def main() -> None:
     args = build_parser().parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -571,6 +654,127 @@ def main() -> None:
                 if not mode_result.get("accepted", False) or not output_result.get("accepted", False):
                     raise RuntimeError(f"control start rejected: mode={mode_result} output={output_result}")
                 control_started = True
+                # New AGX bridges answer SET_MODE(2) with the intermediate
+                # ALIGN_SYNC(5) state ("waiting_sync_first_target") instead of
+                # going straight to RLT_SYNC.  The state expects one first
+                # sync/alignment target per side before it hands control over;
+                # the send guards below legitimately reject every other mode,
+                # so without this handshake the first action chunk dies with
+                # policy_not_owner.  Mirror move_init_pose: wait for
+                # ALIGN_SYNC+output, send the current puppet poses as
+                # zero-motion alignment targets, then wait for the real mode.
+                align_obs = None
+                align_ctrl: dict = {}
+                for _ in range(40):
+                    time.sleep(0.05)
+                    align_obs, _ = client.get_observation(
+                        sides=("left", "right"), images=()
+                    )
+                    align_ctrl = align_obs.get("control", {})
+                    if align_ctrl.get("teach_active", False):
+                        raise RuntimeError(
+                            "startup alignment interrupted by Teach"
+                        )
+                    if (
+                        align_ctrl.get("effective_mode_id") == 5
+                        and align_ctrl.get("output_enabled", False)
+                    ):
+                        break
+                else:
+                    align_obs = None
+                if align_obs is not None:
+                    align_epoch = int(align_ctrl.get("epoch", -1))
+                    if align_epoch < 0:
+                        raise RuntimeError(
+                            f"startup alignment epoch missing: {align_ctrl}"
+                        )
+                    LOG.info(
+                        "bridge entered ALIGN_SYNC (epoch %d); sending "
+                        "zero-motion first sync targets from current poses",
+                        align_epoch,
+                    )
+                    for side in ("left", "right"):
+                        puppet_pos = np.asarray(
+                            align_obs["puppet"][side]["position"],
+                            dtype=np.float64,
+                        )
+                        align_result = client.set_action(
+                            side,
+                            puppet_pos.tolist(),
+                            epoch=align_epoch,
+                            sequence=1,
+                            alignment_speed=0.3,
+                        )
+                        if not align_result.get("accepted", False):
+                            raise RuntimeError(
+                                f"{side} startup alignment target rejected: "
+                                f"{align_result}"
+                            )
+                    alignment_deadline = time.monotonic() + 10.0
+                    while time.monotonic() < alignment_deadline:
+                        time.sleep(0.05)
+                        align_obs, _ = client.get_observation(
+                            sides=("left", "right"), images=()
+                        )
+                        align_ctrl = align_obs.get("control", {})
+                        if align_ctrl.get("teach_active", False):
+                            raise RuntimeError(
+                                "startup alignment interrupted by Teach"
+                            )
+                        align_mode = int(
+                            align_ctrl.get("effective_mode_id", -1)
+                        )
+                        if align_mode == int(args.workflow_mode):
+                            LOG.info(
+                                "startup alignment complete: mode=%d (%.2fs)",
+                                align_mode,
+                                10.0
+                                - (alignment_deadline - time.monotonic()),
+                            )
+                            break
+                        if align_mode not in (5,):
+                            raise RuntimeError(
+                                "startup alignment entered unexpected mode: "
+                                f"{align_ctrl}"
+                            )
+                    else:
+                        raise RuntimeError(
+                            "startup alignment timed out before RLT_SYNC: "
+                            f"{align_ctrl}"
+                        )
+                    # The AGX control node seeds RLT_SYNC with an internal
+                    # "align_hold" joint action that fail-safes back to SAFE
+                    # (post_align_action_timeout = 1.0 s) unless a fresh
+                    # policy-source joint action replaces it.  EEF chunks do
+                    # not refresh that cache, so send one zero-motion joint
+                    # hold per side from the just-aligned poses.
+                    fuse_obs = robot.observe()
+                    for fuse_side in ("left", "right"):
+                        fuse_target = (
+                            fuse_obs.puppet_state
+                            if fuse_side == robot.side
+                            else fuse_obs.position("puppet", fuse_side)
+                        )
+                        try:
+                            fuse_result = robot.send_action_for_side(
+                                fuse_side,
+                                np.asarray(fuse_target, dtype=float).tolist(),
+                                observation=fuse_obs,
+                            )
+                        except ControlNotReady as exc:
+                            LOG.warning(
+                                "post-alignment hold on %s failed: %s",
+                                fuse_side,
+                                exc,
+                            )
+                        else:
+                            LOG.info(
+                                "post-alignment zero-motion hold sent on %s "
+                                "(accepted=%s) to clear the AGX align_hold "
+                                "failsafe fuse",
+                                fuse_side,
+                                fuse_result.get("accepted", False),
+                            )
                 if args.startup_init_hold:
                     auxiliary_holds = _hold_startup_init(robot)
             episode_status = rlt_client.begin_episode(
@@ -605,6 +809,7 @@ def main() -> None:
                 2, int(round(dimensions.action_steps / float(args.rollout_speed)))
             )
             actor_ready = bool(episode_status.get("actor_enabled", False))
+            actor_decisions_executed = 0
             # ``raw`` deliberately bypasses PC-side edge blending and v/a
             # limiting. It is useful to separate policy/chunk behavior from
             # the Edge V4 shaper; the robot bridge continues to interpolate
@@ -619,16 +824,15 @@ def main() -> None:
                 v4_limiter.reset(robot.observe().puppet_state)
             v4_last_command = robot.observe().puppet_state.astype(np.float64, copy=True)
             actor_gate = None
-            if args.rollout_phase == "actor" and args.actor_eef_gate:
+            if args.rollout_phase == "actor":
                 if args.actor_takeover_decisions > 0:
                     actor_gate = DecisionTakeoverGate(args.actor_takeover_decisions)
                     LOG.info(
-                        "actor takeover gate: decision-count latch at %d "
-                        "(~%d frames at 0.5x rollout)",
+                        "actor takeover gate: %d complete reference decisions "
+                        "before Actor exposure",
                         args.actor_takeover_decisions,
-                        args.actor_takeover_decisions * 60,
                     )
-                else:
+                elif args.actor_eef_gate:
                     actor_gate = PiperGraspedEEFInsertionGate(
                         workspace=EEFWorkspace(
                             tuple(args.actor_eef_min), tuple(args.actor_eef_max)
@@ -660,6 +864,10 @@ def main() -> None:
                 float(args.chunk_hz) if args.smooth_profile == "edge_v4" else 0.0
             )
             decisions.file.attrs["actor_eef_gate_enabled"] = bool(actor_gate is not None)
+            decisions.file.attrs["actor_takeover_decisions"] = int(
+                args.actor_takeover_decisions
+            )
+            decisions.file.attrs["actor_max_decisions"] = int(args.actor_max_decisions)
             decisions.file.attrs["q_select_k"] = int(args.q_select)
             if actor_gate is not None:
                 decisions.file.attrs["actor_gate_kind"] = (
@@ -698,6 +906,7 @@ def main() -> None:
             LOG.info("raw recorder ready marker=%s", recorder_marker)
             deadline = time.monotonic() + args.max_seconds
             teach_seen = False
+            actor_takeover_seen = False
             while not STOP_REQUESTED and time.monotonic() < deadline:
                 if args.result_file.exists():
                     outcome = read_result_outcome(args.result_file)
@@ -731,7 +940,17 @@ def main() -> None:
                     cameras=cameras,
                     task=args.task,
                 )
-                actor_takeover = actor_gate.update(observation.puppet_state) if actor_gate else True
+                gate_open = (
+                    actor_gate.update(observation.puppet_state)
+                    if actor_gate
+                    else True
+                )
+                actor_takeover = _actor_control_allowed(
+                    gate_open,
+                    actor_decisions_executed,
+                    args.actor_max_decisions,
+                )
+                first_actor_takeover = actor_takeover and not actor_takeover_seen
 
                 # A terminal click intentionally returns the bridge to SAFE immediately.
                 # Re-check after inference so that this normal stop is not mistaken for a
@@ -785,10 +1004,15 @@ def main() -> None:
                 decision_chunk = np.stack(joint_targets).astype(np.float32, copy=False)
                 edge_start_action = decision_chunk[0].astype(np.float64, copy=True)
                 if args.smooth_profile == "edge_v4":
+                    # The reference -> actor boundary can be much larger than a
+                    # normal chunk boundary. Give this first transition a
+                    # longer connection window without changing the actor's
+                    # trajectory after the offset has decayed.
+                    min_edge_steps = 15 if first_actor_takeover else 3
                     edge_blend_steps, edge_gap = adaptive_edge_blend_steps(
                         v4_last_command,
                         edge_start_action,
-                        min_steps=3,
+                        min_steps=min_edge_steps,
                         max_steps=min(30, len(decision_chunk)),
                         max_joint_step=0.08,
                         action_hz=args.chunk_hz,
@@ -797,7 +1021,9 @@ def main() -> None:
                     )
                 else:
                     edge_blend_steps, edge_gap = 0, 0.0
+                action_chunk_completed = not args.send_actions or source == "human"
                 if args.send_actions and source != "human":
+                    sent_wire_steps = 0
                     try:
                         for wire_step, raw_target in enumerate(decision_chunk):
                             current = robot.observe()
@@ -872,6 +1098,7 @@ def main() -> None:
                             if not result.get("accepted", False):
                                 _raise_for_rejected_action("action chunk", result)
                             v4_last_command = command_target.astype(np.float64, copy=True)
+                            sent_wire_steps += 1
                             tick_deadline = time.monotonic() + 1.0 / args.chunk_hz
                             while time.monotonic() < tick_deadline and not STOP_REQUESTED:
                                 if args.result_file.exists():
@@ -903,6 +1130,10 @@ def main() -> None:
                             )
                             continue
                         raise
+                    action_chunk_completed = sent_wire_steps == len(decision_chunk)
+                if source == "actor" and action_chunk_completed:
+                    actor_decisions_executed += 1
+                    actor_takeover_seen = True
                 # Before the actor phase gate opens, the physical command is
                 # a full 30-step BC chunk whereas Stage 2 tensors are 10-step.
                 # Do not write a false 10-step "executed" target for that
@@ -910,7 +1141,6 @@ def main() -> None:
                 # trace; decision/replay rows begin at actor takeover.
                 record_decision = not (
                     args.rollout_phase == "actor"
-                    and actor_gate is not None
                     and not actor_takeover
                     and source == "reference"
                 )
@@ -943,12 +1173,19 @@ def main() -> None:
                             float(q_sel.get("q_spread", 0.0)),
                         )
                 LOG.info(
-                    "decision=%d source=%s actor_ready=%s actor_takeover=%s eef_xyz=%s "
+                    "decision=%d source=%s actor_ready=%s actor_takeover=%s "
+                    "actor_budget=%d/%s eef_xyz=%s "
                     "chunk_seconds=%.3f action_sent=%s executor=%s edge_steps=%d edge_gap=%.4f",
                     decisions.count,
                     source,
                     actor_ready,
                     actor_takeover,
+                    actor_decisions_executed,
+                    (
+                        "unlimited"
+                        if args.actor_max_decisions <= 0
+                        else str(args.actor_max_decisions)
+                    ),
                     (
                         None
                         if actor_gate is None or actor_gate.last_position is None
@@ -962,6 +1199,10 @@ def main() -> None:
                 )
             else:
                 outcome = "discard"
+            if decisions is not None:
+                decisions.file.attrs["actor_decisions_executed"] = int(
+                    actor_decisions_executed
+                )
     except BaseException:
         outcome = "discard"
         raise
@@ -1062,13 +1303,7 @@ def main() -> None:
             metadata = build_replay_bundle(args.decision_output, args.replay_output)
             LOG.info("replay bundle ready: %s", json.dumps(metadata, sort_keys=True))
     else:
-        args.raw_output.unlink(missing_ok=True)
-        args.raw_output.with_name(args.raw_output.name + ".partial").unlink(missing_ok=True)
-        args.decision_output.unlink(missing_ok=True)
-        args.replay_output.unlink(missing_ok=True)
-        args.replay_output.with_suffix(args.replay_output.suffix + ".json").unlink(missing_ok=True)
-        args.result_file.unlink(missing_ok=True)
-        args.recorder_ready_file.unlink(missing_ok=True)
+        _quarantine_aborted_episode(args)
         LOG.info("episode aborted; no replay bundle saved")
     if outcome in ("success", "failure"):
         args.recorder_ready_file.unlink(missing_ok=True)

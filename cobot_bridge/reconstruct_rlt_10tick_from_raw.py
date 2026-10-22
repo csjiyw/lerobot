@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-"""Rebuild RLinf-compatible 10-tick decision streams directly from raw archives.
+"""Rebuild deployment-time-aligned decision streams from raw archives.
 
-Old dashboard logs were produced by 30-tick open-loop rollout.  Their adjacent
-decisions are therefore 30 policy ticks apart even when the stored action
-chunk happens to have shape ``(10, 7)``.  This offline tool ignores those
-decision logs and samples authoritative 30 Hz raw records at t, t+10, ... .
-Thus each stored transition has exactly the Stage-2 action horizon between
-``obs`` and ``next_obs``.
+At rollout speed 0.5, a 30-waypoint model chunk is phase-resampled to 60 robot
+ticks.  Training therefore needs obs(t), a 30-waypoint inverse-resampling of
+the actual 60-tick command path, and next_obs(t+60).  Merely pairing a 30-tick
+path with next_obs(t+30) teaches a different transition from deployment.
 
 It writes a new decision directory only; use ``build_recap_dense_replay`` on
 the result to attach fixed RECAP potential rewards.  No bridge is opened.
@@ -36,7 +34,13 @@ LOG = logging.getLogger("cobot_bridge.reconstruct_rlt_10tick_from_raw")
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--raw-root", type=Path, required=True)
+    parser.add_argument(
+        "--raw-root",
+        type=Path,
+        action="append",
+        required=True,
+        help="Raw episode directory; repeat to reconstruct several collection batches in one manifest.",
+    )
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--stage1-checkpoint", type=Path, required=True)
     parser.add_argument(
@@ -49,19 +53,79 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--rollout-speed",
+        type=float,
+        default=1.0,
+        help="Deployment retiming factor; 0.5 maps a 30-waypoint model chunk to 60 raw frames.",
+    )
     parser.add_argument("--pattern", default="*.raw.h5")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--fail-fast", action="store_true")
     return parser
 
 
-def ten_tick_starts(frame_count: int, action_steps: int) -> np.ndarray:
-    """Starts whose action window and following observation both exist."""
+def execution_frame_span(action_steps: int, rollout_speed: float) -> int:
+    """Mirror ``rlt_online.resample_action_chunk`` without importing robot code."""
 
     if action_steps <= 0:
         raise ValueError("action_steps must be positive")
+    if not np.isfinite(rollout_speed) or not 0.0 < rollout_speed <= 1.0:
+        raise ValueError("rollout_speed must be in (0, 1]")
+    return max(2, int(round(action_steps / float(rollout_speed))))
+
+
+def aligned_starts(
+    frame_count: int, action_steps: int, rollout_speed: float = 1.0
+) -> np.ndarray:
+    """Starts whose physical execution span and following observation exist."""
+
+    span = execution_frame_span(action_steps, rollout_speed)
     # Need a next decision/observation after the executed action window.
-    return np.arange(0, max(0, frame_count - action_steps), action_steps, dtype=np.int64)
+    return np.arange(0, max(0, frame_count - span), span, dtype=np.int64)
+
+
+def phase_resample(values: np.ndarray, output_steps: int) -> np.ndarray:
+    """Least-squares inverse of deployment's piecewise-linear retiming.
+
+    Directly interpolating 60 recorded samples back to 30 smooths every
+    original knot because most knot phases do not coincide with a 60-point
+    grid.  Solving the known deployment interpolation matrix instead exactly
+    recovers model chunks that were retimed by ``resample_action_chunk`` and
+    gives the closest representable model chunk for a human path.
+    """
+
+    array = np.asarray(values)
+    if array.ndim != 2 or len(array) < 2 or output_steps < 2:
+        raise ValueError("phase_resample expects a (T,D) path and at least two outputs")
+    model_phase = np.linspace(0.0, 1.0, output_steps, dtype=np.float64)
+    physical_phase = np.linspace(0.0, 1.0, len(array), dtype=np.float64)
+    interpolation = np.stack(
+        [
+            np.interp(physical_phase, model_phase, np.eye(output_steps)[column])
+            for column in range(output_steps)
+        ],
+        axis=1,
+    )
+    recovered = np.linalg.lstsq(interpolation, array.astype(np.float64), rcond=None)[0]
+    # The online retimer preserves endpoints exactly; retain that contract for
+    # arbitrary human paths as well as actor-generated paths.
+    recovered[0] = array[0]
+    recovered[-1] = array[-1]
+    return recovered.astype(array.dtype)
+
+
+def phase_resample_mask(mask: np.ndarray, output_steps: int) -> np.ndarray:
+    """Nearest-phase ownership mask for the corresponding resampled actions."""
+
+    values = np.asarray(mask, dtype=bool).reshape(-1)
+    indices = np.rint(np.linspace(0, len(values) - 1, output_steps)).astype(np.int64)
+    return values[indices]
+
+
+# Compatibility alias used by older callers/tests.
+def ten_tick_starts(frame_count: int, action_steps: int) -> np.ndarray:
+    return aligned_starts(frame_count, action_steps, 1.0)
 
 
 def _jpeg(dataset: h5py.Dataset, index: int) -> np.ndarray:
@@ -85,6 +149,7 @@ def reconstruct_one(
     output_root: Path,
     runtime: RLTPolicyRuntime,
     kinematics: PiperForwardKinematics,
+    rollout_speed: float = 1.0,
 ) -> dict:
     stem = raw_path.name.removesuffix(".raw.h5")
     decision_path = output_root / f"{stem}.decisions.h5"
@@ -93,6 +158,11 @@ def reconstruct_one(
     dimensions = RLTDimensions(**runtime.dimensions)
     writer: RLTDecisionWriter | None = None
     runtime.begin_episode(workflow_mode=2, allow_actor=False, actor_exploration_std=0.0)
+    # A normal reference-only online episode deliberately restores the full
+    # Stage-1 horizon.  Offline reconstruction is different: ``action_steps``
+    # defines the future Stage-2 actor horizon, so both its reference slice
+    # and action normalizer must retain the explicit shorter request.
+    runtime.execution_action_steps = int(runtime._requested_action_steps)
     try:
         with h5py.File(raw_path, "r") as raw:
             if not bool(raw.attrs.get("completed", False)):
@@ -108,7 +178,8 @@ def reconstruct_one(
             human = np.asarray(raw["frames/is_human_intervention"], dtype=bool)
             if not (len(executed) == len(valid) == len(state) == len(sequence) == len(timestamps) == len(human)):
                 raise ValueError(f"{raw_path.name}: inconsistent raw frame arrays")
-            starts = ten_tick_starts(len(state), dimensions.action_steps)
+            frame_span = execution_frame_span(dimensions.action_steps, rollout_speed)
+            starts = aligned_starts(len(state), dimensions.action_steps, rollout_speed)
             if len(starts) < 2:
                 raise ValueError(f"{raw_path.name}: fewer than two complete 10-tick decisions")
             image_sets = {camera: raw[f"images/{camera}/jpeg"] for camera in cameras}
@@ -137,20 +208,28 @@ def reconstruct_one(
                     "raw_state_action_space": "piper_joint_radians",
                     "model_state_action_space": "gripper_center_eef_anchor_relative",
                     "source_fps": 30.0,
+                    "action_source_verified": True,
+                    "rollout_speed_scale": float(rollout_speed),
+                    "execution_frame_span": int(frame_span),
+                    "behavior_chunk_source": "raw_executed_deployment_span_phase_resampled_v1",
                 }
             )
             for number, start in enumerate(starts, 1):
-                window = slice(int(start), int(start + dimensions.action_steps))
+                window = slice(int(start), int(start + frame_span))
                 if not valid[window].all():
                     continue
-                is_human = bool(human[window].any())
+                human_mask = phase_resample_mask(human[window], dimensions.action_steps)
+                is_human = bool(human_mask.any())
                 inference = runtime.predict(
                     state=eef_state[start],
                     images={camera: _jpeg(images, int(start)) for camera, images in image_sets.items()},
                     task=str(raw.attrs["task"]),
                     robot_type="cobot_magic_piper",
                 )
-                behavior_eef = chunk_to_relative(eef_state[start], eef_executed[window])
+                behavior_path = phase_resample(
+                    eef_executed[window], dimensions.action_steps
+                )
+                behavior_eef = chunk_to_relative(eef_state[start], behavior_path)
                 behavior = runtime.normalize_actions(behavior_eef)
                 # The replay action is the action actually executed.  Keep the
                 # frozen VLA proposal separately as the actor BC fallback.
@@ -160,10 +239,12 @@ def reconstruct_one(
                     reference_actions=inference["reference_actions"],
                     policy_actions=behavior,
                     executed_actions=behavior,
-                    action_source="human" if is_human else "actor",
+                    action_source="human" if is_human else "unknown",
                     is_intervention=is_human,
+                    action_human_mask=human_mask,
                     bridge_sequence=int(sequence[start]),
                     time_ns=int(timestamps[start]),
+                    episode_frame_index=int(start),
                 )
                 if number == 1 or number % 50 == 0:
                     LOG.info("%s decision=%d/%d", stem, number, len(starts))
@@ -190,10 +271,14 @@ def main() -> None:
     # on network availability.
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    raw_root = args.raw_root.expanduser().resolve()
+    raw_roots = [path.expanduser().resolve() for path in args.raw_root]
     output_root = args.output_root.expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
-    paths = sorted(raw_root.glob(args.pattern))
+    paths = sorted(path for root in raw_roots for path in root.glob(args.pattern))
+    names = [path.name for path in paths]
+    if len(names) != len(set(names)):
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        raise ValueError(f"duplicate raw episode names across --raw-root values: {duplicates}")
     if args.limit is not None:
         paths = paths[: args.limit]
     if not paths:
@@ -214,7 +299,9 @@ def main() -> None:
     started = time.monotonic()
     for index, path in enumerate(paths, 1):
         try:
-            row = reconstruct_one(path, output_root, runtime, kinematics)
+            row = reconstruct_one(
+                path, output_root, runtime, kinematics, rollout_speed=args.rollout_speed
+            )
             complete.append(row)
             LOG.info("episode=%d/%d DONE %s", index, len(paths), path.name)
         except Exception as error:
@@ -226,7 +313,9 @@ def main() -> None:
             json.dumps(
                 {
                     "stage1_checkpoint": str(runtime.stage1_path),
-                    "contract": "raw_contiguous_10tick_v1",
+                    "raw_roots": [str(path) for path in raw_roots],
+                    "contract": "deployment_span_phase_resampled_v1",
+                    "rollout_speed": float(args.rollout_speed),
                     "target": len(paths),
                     "done": len(complete),
                     "failed": failed,

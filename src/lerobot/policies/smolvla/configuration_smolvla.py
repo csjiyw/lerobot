@@ -68,6 +68,22 @@ class SmolVLAConfig(PreTrainedConfig):
     use_relative_eef_actions: bool = False
     relative_eef_action_stats_path: str | None = None
 
+    # When True (and use_relative_eef_actions), the chunk-relative EEF action
+    # transform is computed per-sample inside the dataset worker (parallel
+    # across DataLoader workers) instead of in the policy preprocessor (main
+    # process, per batch). The preprocessor's relative-EEF step is skipped in
+    # that case. Action normalization statistics are unchanged either way.
+    eef_relative_in_dataset: bool = False
+
+    # When True (and use_relative_eef_actions), the chunk-relative EEF action
+    # transform is computed by a vectorized torch step in the preprocessor,
+    # placed after the device move so it runs on GPU in float32 (batched,
+    # no per-sample python loop). Mutually exclusive with eef_relative_in_dataset.
+    # The preprocessor's CPU relative-EEF step is skipped in that case; action
+    # normalization statistics are unchanged either way.
+    eef_relative_in_gpu: bool = False
+    use_sdpa: bool = False
+
     # Tokenizer
     tokenizer_max_length: int = 48
 
@@ -84,6 +100,14 @@ class SmolVLAConfig(PreTrainedConfig):
     # Hide the complete normalized state vector for a training sample with
     # this probability. Inference never applies this dropout.
     state_dropout: float = 0.0
+    # Fixed indices in normalized observation.state that are hidden from the
+    # policy in both training and inference. Action labels and relative-EEF
+    # anchoring continue to use the complete, unmasked state.
+    state_mask_indices: tuple[int, ...] = ()
+    # v4 metal-task additions (2026-10-14): anti-state-shortcut + half-unfreeze vision.
+    state_noise_std: float = 0.0
+    camera_dropout: float = 0.0
+    unfreeze_vision_last_blocks: int = 0
 
     # Training presets
     optimizer_lr: float = 1e-4
@@ -132,6 +156,24 @@ class SmolVLAConfig(PreTrainedConfig):
             )
         if not 0.0 <= self.state_dropout <= 1.0:
             raise ValueError(f"`state_dropout` must be in [0, 1], got {self.state_dropout}.")
+        if len(set(self.state_mask_indices)) != len(self.state_mask_indices):
+            raise ValueError("`state_mask_indices` must not contain duplicates.")
+        invalid_state_indices = [
+            index
+            for index in self.state_mask_indices
+            if not isinstance(index, int) or index < 0 or index >= self.max_state_dim
+        ]
+        if invalid_state_indices:
+            raise ValueError(
+                "`state_mask_indices` must be integers in "
+                f"[0, {self.max_state_dim}); got {invalid_state_indices}."
+            )
+        if self.state_noise_std < 0:
+            raise ValueError(f"`state_noise_std` must be >= 0, got {self.state_noise_std}.")
+        if not 0.0 <= self.camera_dropout <= 1.0:
+            raise ValueError(f"`camera_dropout` must be in [0, 1], got {self.camera_dropout}.")
+        if self.unfreeze_vision_last_blocks and not self.freeze_vision_encoder:
+            raise ValueError("`unfreeze_vision_last_blocks` requires freeze_vision_encoder=True.")
         if self.use_delta_joint_actions_aloha:
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."

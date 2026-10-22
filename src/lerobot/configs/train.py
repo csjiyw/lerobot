@@ -51,12 +51,19 @@ class TrainPipelineConfig(HubMixin):
     # resume. Disable this to keep optimizer moments while starting a newly
     # configured learning-rate schedule from its first step.
     resume_scheduler: bool = True
+    # Targeted fine-tuning can retain the checkpoint's complete processor
+    # contract instead of rebasing normalization on the new sample dataset.
+    # Dataset metadata still contains the new data's actual statistics.
+    inherit_pretrained_processors: bool = False
     # `seed` is used for training (eg: model initialization, dataset shuffling)
     # AND for the evaluation environments.
     seed: int | None = 1000
     # Number of workers for the dataloader.
     num_workers: int = 4
     batch_size: int = 8
+    # Opt-in episode-local consecutive blocks and shared batch video decode.
+    # 1 preserves the existing random-frame sampling and decoder behavior.
+    consecutive_frames_per_sample: int = 1
     steps: int = 100_000
     eval_freq: int = 20_000
     log_freq: int = 200
@@ -113,6 +120,9 @@ class TrainPipelineConfig(HubMixin):
             raise ValueError(
                 "Policy is not configured. Please specify a pretrained policy with `--policy.path`."
             )
+
+        if self.inherit_pretrained_processors and not self.policy.pretrained_path:
+            raise ValueError("inherit_pretrained_processors requires policy.pretrained_path")
 
         if not self.job_name:
             if self.env is None:

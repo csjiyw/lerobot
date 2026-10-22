@@ -146,6 +146,7 @@ def build_one(
                     "built_from_raw": "10tick_contiguous_30hz_v1",
                     "behavior_chunk_source": "raw_executed_contiguous_30hz",
                     "raw_archive": str(raw_path),
+                    "action_source_verified": True,
                 }
             )
             runtime.begin_episode(workflow_mode=workflow_mode, allow_actor=False,
@@ -175,10 +176,11 @@ def build_one(
                         reference_actions=inference["reference_actions"],
                         policy_actions=behavior,
                         executed_actions=behavior,
-                        action_source="human" if is_human_window else "actor",
+                        action_source="human" if is_human_window else "unknown",
                         is_intervention=is_human_window,
                         bridge_sequence=int(sequence[int(start)]),
                         time_ns=int(timestamps[int(start)]),
+                        episode_frame_index=int(start),
                     )
                     written += 1
                     if number == 1 or number % 25 == 0:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -10,6 +11,9 @@ from fastapi.testclient import TestClient
 import cobot_bridge.web_dashboard as web_dashboard
 from cobot_bridge.web_dashboard import (
     DashboardConfig,
+    GROOT_EEF_POLICY_ID,
+    JobManager,
+    ManagedJob,
     _device_status,
     _policy_files,
     _raw_files,
@@ -63,10 +67,12 @@ class FakeDeviceMonitor:
 
 def test_default_checkpoint_root_is_training_outputs(monkeypatch):
     monkeypatch.delenv("COBOT_CHECKPOINT_ROOT", raising=False)
+    monkeypatch.delenv("COBOT_LEROBOT_REPLAY_ROOT", raising=False)
 
     config = DashboardConfig.from_env()
 
     assert config.checkpoint_root == config.workspace / "outputs"
+    assert config.lerobot_replay_root == Path.home() / "datasets" / "lerobot_v21"
 
 
 def test_rlt_page_restores_resident_server_actor_after_refresh(tmp_path):
@@ -76,7 +82,9 @@ def test_rlt_page_restores_resident_server_actor_after_refresh(tmp_path):
     script = client.get("/static/app.js")
 
     assert page.status_code == 200
-    assert 'app.js?v=20260917-rollout-current-pose-1' in page.text
+    assert 'app.js?v=' in page.text
+    assert 'id="replayDataset"' in page.text
+    assert 'id="stopReplayButton" class="button danger" disabled>Pause / SAFE</button>' in page.text
     assert '<option value="0.0001">0.0001 · ~0.01–0.014 mm / 0.001°</option>' in page.text
     assert script.status_code == 200
     assert 'serverActorCheckpointId = rltServer.checkpoint_id === selected?.id' in script.text
@@ -84,12 +92,121 @@ def test_rlt_page_restores_resident_server_actor_after_refresh(tmp_path):
     assert 'Recovered · Actor published' in script.text
 
 
+def test_runtime_notifications_keep_manual_refresh_and_validate_cursor(tmp_path):
+    client, _manager = make_client(tmp_path)
+    page = client.get('/')
+    script = client.get('/static/app.js')
+    assert 'id="runtimeEventHint"' in page.text
+    assert 'fetch("/api/events"' in script.text
+    assert 'Last-Event-ID' in script.text
+    assert 'setInterval(' not in script.text
+    assert client.get('/api/events', headers={'Last-Event-ID':'invalid'}).status_code == 400
+
+
+def test_sync_status_is_independent_left_sidebar(tmp_path):
+    client, _ = make_client(tmp_path)
+    page = client.get('/').text
+    css = client.get('/static/styles.css').text
+    start = page.index('<aside class="control-sidebar"')
+    end = page.index('</aside>', start)
+    sidebar = page[start:end]
+    assert end < page.index('<main class="dashboard-shell">')
+    for name in ('moveRltInitPoseButton', 'safeButton', 'bridgeBadge', 'modeValue', 'robotStatusHint'):
+        assert f'id="{name}"' in sidebar
+    assert page.count('id="robotStatusHint"') == 1
+    assert 'grid-template-columns: 250px minmax(0, 1fr)' in css
+    assert '.dashboard-workspace > main { width: 100%; min-width: 0;' in css
+    assert '.control-sidebar { position: static;' in css
+
+
+def test_priority_status_probe_excludes_joints_images_and_scans(tmp_path, monkeypatch):
+    client, _ = make_client(tmp_path)
+    config = client.app.state.dashboard_config
+    calls = []
+    robot = {'control': {'effective_mode':'SAFE', 'effective_mode_id':0, 'teach_active':False,
+                         'output_enabled':False, 'emergency_latched':False, 'epoch':1}, 'ready':True,
+             'master':{}, 'puppet':{}, 'images':{}}
+    for role in ('master', 'puppet'):
+        robot[role] = {s: {'fresh':True, 'position':[0.]*7, 'age_ms':1.} for s in ('left','right')}
+    robot['images'] = {n: {'fresh':True, 'stamp_ns':123} for n in ('front','left','right')}
+    class StatusClient:
+        def __init__(self, endpoint, **kw): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def ping(self): return {'allow_control':True}
+        def get_observation(self, **kw):
+            calls.append(kw)
+            return robot, {}
+    monkeypatch.setattr(web_dashboard, 'CobotBridgeClient', StatusClient)
+    monitor = web_dashboard.DeviceMonitor(config)
+    first = monitor.control_status()
+    robot['puppet']['right']['position'][0] = 1.
+    robot['puppet']['right']['age_ms'] = 3.
+    assert monitor.control_status() == first
+    before = len(calls)
+    joints = monitor.joint_state()
+    assert joints['arms']['puppet_right']['position'][0] == 1.
+    assert joints['revision'] == 2
+    monitor.joint_state()
+    assert len(calls) == before  # Local cache reads must not query the robot.
+    assert calls[0]['images'] == ()
+    assert 'position' not in json.dumps(first)
+    assert 'stamp_ns' not in json.dumps(first)
+    assert first['devices']['ok_count'] == 7
+    robot['control']['teach_active'] = True
+    assert monitor.control_status()['teach_active'] is True
+    robot['control'] = {}
+    assert monitor.control_status()['allow_control'] is False
+
+
+def test_priority_sse_frontend_expiry_and_no_directory_refresh(tmp_path):
+    client, _ = make_client(tmp_path)
+    script = client.get('/static/app.js').text
+    assert 'id="robotStatusHint"' in client.get('/').text
+    assert 'robotStatusStale("SSE 连接断开")' in script
+    assert 'else mergeRobotStatus(overview)' in script
+    assert 'robot_status_changed' in script and 'robot_heartbeat' in script
+    safety = script.split('async function emergencySafe()')[1].split('async function restartDevices()')[0]
+    assert 'refresh()' not in safety
+
+
+def test_joint_cache_age_and_api_auth(tmp_path, monkeypatch):
+    client, manager = make_client(tmp_path)
+    config = replace(client.app.state.dashboard_config, api_token='secret')
+    monitor = web_dashboard.DeviceMonitor(config)
+    now = [10.]
+    monkeypatch.setattr(web_dashboard.time, 'monotonic', lambda: now[0])
+    assert monitor.joint_state()['revision'] == 0
+    monitor._joint_cached_at = 10.
+    monitor._joint_cache = {'revision':1, 'arms': {'puppet_right': {'position':[0.]*7, 'fresh':True, 'age_ms':2.}}}
+    assert monitor.joint_state()['arms']['puppet_right']['fresh'] is True
+    now[0] = 12.
+    aged = monitor.joint_state()
+    assert aged['age_ms'] == 2000
+    assert aged['arms']['puppet_right']['fresh'] is False
+    assert aged['arms']['puppet_right']['age_ms'] == 2002
+    local = TestClient(create_app(config, manager, monitor))
+    assert local.get('/api/robot/joints').status_code == 401
+    assert local.get('/api/robot/joints', headers={'X-Cobot-Token':'secret'}).json()['revision'] == 1
+
+
+def test_joint_feedback_has_own_low_rate_handler(tmp_path):
+    client, _ = make_client(tmp_path)
+    script = client.get('/static/app.js').text
+    assert 'if (kind === "joint_state") { handleJointState(data); return; }' in script
+    assert '低频实时' in script
+    assert 'setTimeout(jointStateStale, 2000)' in script
+    body = script.split('function handleJointState(data)')[1].split('function renderCapabilities')[0]
+    assert 'refresh()' not in body
+
+
 def make_client(tmp_path: Path):
     workspace = Path(__file__).resolve().parents[2]
     raw_root = tmp_path / "raw"
     dataset_root = tmp_path / "datasets"
+    lerobot_replay_root = tmp_path / "lerobot_v21"
     checkpoint_root = tmp_path / "checkpoints"
-    for root in (raw_root, dataset_root, checkpoint_root):
+    for root in (raw_root, dataset_root, lerobot_replay_root, checkpoint_root):
         root.mkdir()
     raw = raw_root / "episode.raw.h5"
     raw.write_bytes(b"placeholder")
@@ -97,6 +214,33 @@ def make_client(tmp_path: Path):
     (dataset / "meta").mkdir(parents=True)
     (dataset / "meta/info.json").write_text(
         json.dumps({"total_frames": 1, "total_episodes": 1, "fps": 30})
+    )
+    replay_dataset = (
+        lerobot_replay_root
+        / "cobotmagic"
+        / "5482b62ee3ff498a92f139f0788c0544_head_eef_joint"
+    )
+    (replay_dataset / "meta").mkdir(parents=True)
+    (replay_dataset / "meta/info.json").write_text(
+        json.dumps(
+            {
+                "total_frames": 5,
+                "total_episodes": 1,
+                "fps": 30,
+                "robot_type": "cobotmagic",
+                "features": {
+                    "action_joint": {
+                        "names": {
+                            "motors": [
+                                "l-j1", "l-j2", "l-j3", "l-j4", "l-j5", "l-j6",
+                                "r-j1", "r-j2", "r-j3", "r-j4", "r-j5", "r-j6",
+                                "left_gripper", "right_gripper",
+                            ]
+                        }
+                    }
+                },
+            }
+        )
     )
     policy = checkpoint_root / "policy"
     policy.mkdir()
@@ -109,6 +253,7 @@ def make_client(tmp_path: Path):
         checkpoint_root=checkpoint_root,
         run_root=tmp_path / "runs",
         python=Path("/test/python"),
+        lerobot_replay_root=lerobot_replay_root,
         debug_root=tmp_path / "debug_rollouts",
         debug_capture_enabled=False,
         rlt_root=tmp_path / "rlt",
@@ -167,7 +312,7 @@ def test_dashboard_exposes_rollout_speed_control(tmp_path):
 
     assert response.status_code == 200
     assert 'id="rolloutFps"' in response.text
-    assert '<option value="15" selected>0.5× · 15 FPS</option>' in response.text
+    assert '<option value="30" selected>1.0× · 30 FPS</option>' in response.text
 
 
 def test_dashboard_and_fixed_record_command(tmp_path):
@@ -198,6 +343,9 @@ def test_dashboard_and_fixed_record_command(tmp_path):
     assert 'id="moveRlInitPoseButton"' in page.text
     assert 'id="startPolicyServerButton"' in page.text
     assert 'id="stopPolicyServerButton"' in page.text
+    assert 'id="policyDenoisingSteps"' in page.text
+    assert 'value="5">5 steps · faster' in page.text
+    assert 'value="10" selected>10 steps · checkpoint default' in page.text
     assert '<details class="rlt-checks">' in page.text
     assert "Checks &amp; Diagnostics" in page.text
     assert 'id="startRltServerButton"' in page.text
@@ -294,6 +442,54 @@ def test_policy_inventory_discovers_sharded_groot_model(tmp_path):
 
     entry = next(item for item in policies if item["id"] == "groot_run")
     assert entry["type"] == "groot"
+
+
+def test_registered_external_groot_eef_checkpoint_is_selectable_and_launchable(
+    tmp_path, monkeypatch
+):
+    client, manager = make_client(tmp_path)
+    config = client.app.state.dashboard_config
+    external = tmp_path / "outside_outputs" / "checkpoint-90000"
+    external.mkdir(parents=True)
+    (external / "config.json").write_text(
+        json.dumps({"architectures": ["Gr00tN1d7"]})
+    )
+    (external / "model.safetensors.index.json").write_text("{}")
+    (external / "processor_config.json").write_text(
+        json.dumps({"processor_kwargs": {"modality_configs": {"cobotmagic": {}}}})
+    )
+    backbone = tmp_path / "cosmos_backbone"
+    backbone.mkdir()
+    config = replace(
+        config,
+        groot_eef_checkpoint_path=external,
+        groot_backbone_path=backbone,
+    )
+    client = TestClient(create_app(config, manager))
+    monkeypatch.setattr(
+        web_dashboard,
+        "_policy_server_status",
+        lambda *_args: {
+            "ready": False,
+            "state": "offline",
+            "endpoint": "tcp://127.0.0.1:1",
+        },
+    )
+
+    inventory = _policy_files(config)
+    registered = next(item for item in inventory if item["id"] == GROOT_EEF_POLICY_ID)
+    assert registered["type"] == "groot"
+    assert registered["step"] == 90000
+
+    response = client.post(
+        "/api/policy-server/start",
+        json={"policy_id": GROOT_EEF_POLICY_ID, "device": "cuda:1", "compute": "pc"},
+    )
+
+    assert response.status_code == 200
+    _, command = manager.started[-1]
+    assert command[command.index("--model-path") + 1] == str(external)
+    assert command[command.index("--backbone-path") + 1] == str(backbone)
 
 
 def test_raw_inventory_exposes_collection_and_episode(tmp_path):
@@ -428,6 +624,110 @@ def test_real_motion_requires_confirmation(tmp_path):
     assert command[command.index("--waypoint-hz") + 1] == "30"
 
 
+def test_lerobot_replay_is_right_arm_only_and_requires_confirmation(tmp_path, monkeypatch):
+    client, manager = make_client(tmp_path)
+    dataset_id = "cobotmagic/5482b62ee3ff498a92f139f0788c0544_head_eef_joint"
+    replay_h5 = tmp_path / "converted.raw.h5"
+    monkeypatch.setattr(
+        web_dashboard,
+        "export_episode_to_raw",
+        lambda *_args, **_kwargs: {
+            "path": str(replay_h5),
+            "frames": 123,
+            "fps": 30,
+            "task": "insert workpiece",
+            "side": "right",
+            "source_feature": "action_joint",
+            "joint_dimensions": ["r-j1", "r-j2", "r-j3", "r-j4", "r-j5", "r-j6", "right_gripper"],
+        },
+    )
+
+    denied = client.post(
+        "/api/jobs/replay-lerobot",
+        json={"dataset_id": dataset_id, "episode_index": 0, "execute": True},
+    )
+    assert denied.status_code == 400
+    assert manager.started == []
+
+    overview = client.get("/api/overview")
+    assert overview.status_code == 200
+    assert overview.json()["lerobot_replay_datasets"][0]["id"] == dataset_id
+
+    allowed = client.post(
+        "/api/jobs/replay-lerobot",
+        json={
+            "dataset_id": dataset_id,
+            "episode_index": 0,
+            "side": "right",
+            "execute": True,
+            "confirm_motion": True,
+        },
+    )
+    assert allowed.status_code == 200
+    kind, command = manager.started[-1]
+    assert kind == "replay_execute"
+    assert command[command.index("--side") + 1] == "right"
+    assert command[command.index("--mode") + 1] == "puppet"
+    assert command[command.index("--source") + 1] == "puppet_command"
+    assert "--no-trim-stationary-holds" in command
+    assert command[command.index("--alignment-speed") + 1] == "0.05"
+    assert command[command.index("--alignment-min-seconds") + 1] == "5.0"
+    assert command[-1] == "--execute"
+    assert allowed.json()["metadata"]["dataset_id"] == dataset_id
+    assert allowed.json()["metadata"]["episode_index"] == 0
+
+
+def test_stop_motion_job_requests_safe_output_before_signalling(tmp_path, monkeypatch):
+    client, _fake_manager = make_client(tmp_path)
+    config = client.app.state.dashboard_config
+    manager = JobManager(config)
+
+    class RunningProcess:
+        pid = 67890
+
+        @staticmethod
+        def poll():
+            return None
+
+    class NoStartThread:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        @staticmethod
+        def start():
+            pass
+
+    job = ManagedJob(
+        id="replay-job",
+        kind="replay_execute",
+        command=[],
+        log_path=tmp_path / "replay.log",
+        started_at_ns=1,
+        process=RunningProcess(),
+        metadata={},
+    )
+    manager._jobs[job.id] = job
+    safety_calls = []
+    signals = []
+    monkeypatch.setattr(
+        web_dashboard,
+        "request_robot_safe_stop",
+        lambda endpoint, **_kwargs: safety_calls.append(endpoint) or {
+            "output_disabled": {},
+            "mode_safe": {},
+            "safe": True,
+        },
+    )
+    monkeypatch.setattr(web_dashboard.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+    monkeypatch.setattr(web_dashboard.threading, "Thread", NoStartThread)
+
+    result = manager.stop(job.id)
+
+    assert safety_calls == [config.endpoint]
+    assert signals and signals[0][0] == job.process.pid
+    assert result["metadata"]["stop_safety"]["safe"] is True
+
+
 def test_restart_devices_starts_managed_recovery_job(tmp_path):
     client, manager = make_client(tmp_path)
     client = TestClient(
@@ -443,6 +743,48 @@ def test_restart_devices_starts_managed_recovery_job(tmp_path):
     assert command[:3] == ["/test/python", "-m", "cobot_bridge.restart_devices"]
     assert "--ssh-host" in command
     assert "--remote-workspace" in command
+
+
+def test_robot_startup_available_when_bridge_offline(tmp_path):
+    client, manager = make_client(tmp_path)
+    response = client.post('/api/system/start-robot', json={})
+    assert response.status_code == 200
+    kind, command = manager.started[-1]
+    assert kind == 'robot_startup'
+    assert command[:3] == ['/test/python', '-m', 'cobot_bridge.ensure_robot']
+    assert '--report' in command
+    assert manager.motion_stopped is False
+
+
+def test_robot_self_check_command_and_ui(tmp_path):
+    client, manager = make_client(tmp_path)
+    response = client.post('/api/system/start-robot', json={'check_only': True})
+    assert response.status_code == 200
+    assert manager.started[-1][0] == 'robot_self_check'
+    assert '--check-only' in manager.started[-1][1]
+    assert 'id="startRobotButton"' in client.get('/').text
+    assert 'id="robotStartupReport"' in client.get('/').text
+
+
+def test_system_page_uses_content_height(tmp_path):
+    client, _ = make_client(tmp_path)
+    script = client.get('/static/app.js').text
+    css = client.get('/static/styles.css').text
+    page = client.get('/').text
+    assert '["il", "rl", "rlt", "data", "system"].includes(name)' in script
+    assert 'body.document-scroll .system-layout { height: auto; align-items: start; }' in css
+    assert 'body.document-scroll .system-layout > .panel' in css
+    assert 'id="robotStartupReport" style=' not in page
+    assert 'class="panel robot-startup-panel"' in page
+    assert '.system-layout .readiness-panel { min-height: 0; align-items: center; flex-direction: row;' in css
+
+
+def test_robot_startup_refuses_active_recording(tmp_path):
+    client, manager = make_client(tmp_path)
+    manager.jobs = [{'id':'rec', 'kind':'record', 'state':'running'}]
+    response = client.post('/api/system/start-robot', json={})
+    assert response.status_code == 409
+    assert manager.started == []
 
 
 def test_groot_model_server_uses_groot_environment_and_pc(tmp_path, monkeypatch):
@@ -495,13 +837,14 @@ def test_model_server_and_rollout_are_separate_jobs(tmp_path, monkeypatch):
 
     started = client.post(
         "/api/policy-server/start",
-        json={"policy_id": "policy", "device": "cuda:0"},
+        json={"policy_id": "policy", "device": "cuda:0", "num_steps": 5},
     )
 
     assert started.status_code == 200
     kind, command = manager.started[-1]
     assert kind == "policy_server"
     assert command[:3] == ["/test/python", "-m", "cobot_bridge.policy_server"]
+    assert command[command.index("--num-steps") + 1] == "5"
     assert "--bind" in command
     assert "--cameras" in command
     assert "--n-action-steps" not in command
@@ -511,7 +854,7 @@ def test_model_server_and_rollout_are_separate_jobs(tmp_path, monkeypatch):
 
     robot_started = client.post(
         "/api/policy-server/start",
-        json={"policy_id": "policy", "device": "cuda:0", "compute": "robot"},
+        json={"policy_id": "policy", "device": "cuda:0", "compute": "robot", "num_steps": 20},
     )
     assert robot_started.status_code == 200
     kind, command = manager.started[-1]
@@ -519,6 +862,7 @@ def test_model_server_and_rollout_are_separate_jobs(tmp_path, monkeypatch):
     assert command[:3] == ["/test/python", "-m", "cobot_bridge.remote_policy_server"]
     assert command[command.index("--ssh-host") + 1] == "agilex@192.168.250.2"
     assert command[command.index("--policy-id") + 1] == "policy"
+    assert command[command.index("--num-steps") + 1] == "20"
     assert manager.jobs[0]["metadata"]["compute"] == "robot"
 
 
@@ -546,7 +890,7 @@ def test_model_server_and_rollout_are_separate_jobs(tmp_path, monkeypatch):
     kind, command = manager.started[-1]
     assert kind == "policy_execute"
     assert "--policy-server-endpoint" in command
-    assert "--startup-init-hold" not in command
+    assert "--startup-init-hold" in command
     assert "--policy-path" not in command
     assert "--dataset-root" not in command
     assert "--dataset-repo-id" not in command
@@ -752,7 +1096,7 @@ def test_robot_gpu_server_runs_rollout_pipeline_on_robot(tmp_path, monkeypatch):
     assert command[command.index("--policy-server-endpoint") + 1] == "tcp://127.0.0.1:5560"
     assert command[command.index("--runner") + 1] == "standard"
     assert "--send-actions" in command
-    assert "--startup-init-hold" not in command
+    assert "--startup-init-hold" in command
     assert manager.jobs[0]["metadata"]["compute"] == "robot"
 
 
@@ -1140,10 +1484,11 @@ def test_rlt_tab_inventory_and_read_only_jobs(tmp_path, monkeypatch):
     reference_command = manager.started[-1][1]
     assert reference_command[reference_command.index("--rollout-phase") + 1] == "reference"
     assert reference_command[reference_command.index("--actor-exploration-std") + 1] == "0.0"
-    assert reference_command[reference_command.index("--rollout-speed") + 1] == "1.0"
+    assert reference_command[reference_command.index("--rollout-speed") + 1] == "0.5"
     assert "--replan-actions" not in reference_command
     assert "--startup-init-hold" not in reference_command
     assert "--enable-actor" not in reference_command
+    assert reference_command[reference_command.index("--actor-max-decisions") + 1] == "0"
     assert reference_online.json()["actor_enabled"] is False
     assert manager.jobs[-1]["metadata"]["training_requested"] is False
     manager.jobs = []
@@ -1185,6 +1530,13 @@ def test_rlt_tab_inventory_and_read_only_jobs(tmp_path, monkeypatch):
     # controlled data collection, but must not silently start async updates.
     assert selected_actor_online.status_code == 200
     assert selected_actor_online.json()["inference_only"] is True
+    selected_actor_command = manager.started[-1][1]
+    assert (
+        selected_actor_command[
+            selected_actor_command.index("--actor-max-decisions") + 1
+        ]
+        == "1"
+    )
     assert manager.jobs[-1]["metadata"]["training_requested"] is False
     manager.jobs = []
 
@@ -1431,3 +1783,53 @@ def test_convert_accepts_hybrid_il_action_rule_and_trim(tmp_path):
         "puppet_state_t3_arm_cmd_gripper"
     )
     assert "--trim-stationary-holds" in command
+
+
+def test_tcp_endpoint_probe_detects_a_live_holder():
+    import socket
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    try:
+        endpoint = f"tcp://127.0.0.1:{listener.getsockname()[1]}"
+        assert web_dashboard._tcp_endpoint_in_use(endpoint)
+    finally:
+        listener.close()
+    assert not web_dashboard._tcp_endpoint_in_use(endpoint)
+
+
+def test_tcp_endpoint_probe_ignores_non_tcp_transports():
+    assert not web_dashboard._tcp_endpoint_in_use("ipc:///tmp/rlt-policy-server")
+    assert not web_dashboard._tcp_endpoint_in_use("inproc://whatever")
+
+
+def test_actor_frame_gate_converts_to_complete_reference_decisions():
+    assert web_dashboard._actor_takeover_decisions_for_frame(960, 30, 0.5) == 16
+    assert web_dashboard._actor_takeover_decisions_for_frame(780, 30, 0.5) == 13
+    assert web_dashboard._actor_takeover_decisions_for_frame(None, 30, 0.5) == 0
+
+
+def test_v7_actor_uses_deployment_handover_at_decision_9():
+    checkpoint = Path(
+        "/tmp/checkpoints/"
+        "cobot_magic_smolvla_il2trimrel80k_rlt_stage1_rlinf960_ref30_actor30_5k_"
+        "bs64_stage2_actor20_speed05_seq_m26q1_ilfakebc_v1v4q1_utd5_g720_loose_"
+        "v1_frozen83_v7/latest.pt"
+    )
+    assert (
+        web_dashboard._actor_takeover_decisions_for_checkpoint(
+            checkpoint, 720, 30, 0.5
+        )
+        == 9
+    )
+
+
+def test_other_actor_keeps_checkpoint_frame_gate():
+    checkpoint = Path("/tmp/checkpoints/other_actor/latest.pt")
+    assert (
+        web_dashboard._actor_takeover_decisions_for_checkpoint(
+            checkpoint, 720, 30, 0.5
+        )
+        == 12
+    )

@@ -33,6 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bind", default="tcp://0.0.0.0:5560")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--cameras", nargs="+", default=("front", "right"))
+    parser.add_argument("--num-steps", type=int, choices=(5, 10, 20), default=None)
     return parser
 
 
@@ -146,6 +147,8 @@ def main() -> None:
         "--cameras",
         *args.cameras,
     ]
+    if args.num_steps is not None:
+        server.extend(("--num-steps", str(args.num_steps)))
     pythonpath = f"{remote_workspace / 'src'}:{remote_workspace}"
     remote_command = (
         f"cd {shlex.quote(str(remote_workspace))} && "

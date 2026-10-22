@@ -1,0 +1,79 @@
+# sampler_rosbag ROS2 参数文件
+
+# 清晰的两模块配置架构（无GMSL）
+sampler_rosbag:
+  ros__parameters:
+    # ========== 存储配置 ==========
+    data_storage_root: "/tmp/data_storage"
+    temp_folder: "/tmp/ros_bags"
+    camera_save_root: "camera"
+    depth_output_dir: "depth"
+
+    # ========== WebSocket 配置 ==========
+    websocket_port: 18780
+
+    # ========== 协议配置 ==========
+    openloong_cmd_ver: "2.0.0"
+    data_format: "COMMON_V2"
+    model: "QINGLONG_HAND"
+
+    # ==================================================================
+    # 模块 1: ROS2 非图像话题（关节数据等）
+    # ==================================================================
+    ros2_topics:
+      names:
+        # 关节状态话题
+        - "/odom"                         # synthetic zero odometry in local test mode
+        - "/cmd_vel"                     # 期望速度和角速度
+        - "/master/joint_left"           # 期望左臂关节角
+        - "/master/joint_right"          # 期望右臂
+        - "/puppet/joint_left"           # 状态左臂
+        - "/puppet/joint_right"          # 状态右臂
+        - "/camera_f/color/camera_info"  # 摄像头内参
+        - "/camera_l/color/camera_info"
+        - "/camera_r/color/camera_info"
+        # 关节指令话题 (7个部件) - 已注释
+        # - "/astribot_chassis/joint_space_command"
+        # - "/astribot_torso/joint_space_command"
+        # - "/astribot_arm_left/joint_space_command"
+        # - "/astribot_gripper_left/joint_space_command"
+        # - "/astribot_arm_right/joint_space_command"
+        # - "/astribot_gripper_right/joint_space_command"
+        # - "/astribot_head/joint_space_command"
+      
+      # 对应频率: 9个话题对应9个频率
+      fpses: [50, 50, 200, 200, 200, 200, 30, 30, 30]
+
+    # ==================================================================
+    # 模块 2: ROS2 图像话题（RGB + 深度）
+    # ==================================================================
+    enable_ros2_cameras: true  # 是否启用相机模块
+
+    # ROS2 相机配置列表
+    ros2_cameras:
+      names: ["camera_f", "camera_l", "camera_r"]
+      rgb_topics:
+        - "/camera_f/color/image_raw/compressed"
+        - "/camera_l/color/image_raw/compressed"
+        - "/camera_r/color/image_raw/compressed"
+      depth_topics:
+        - ""  # 仅 head_rgbd 有深度，此处留空
+      fpses: [30, 30, 30]
+      enable_previews: [true, true, true]  # 是否启用预览
+
+    # ==================================================================
+    # 配置说明
+    # ==================================================================
+    # 
+    # 【模块 1+2: ROS2 话题（非图像 + 图像）】
+    # - 所有 ROS2 话题统一录制到 ROS bag 文件中
+    # - 包括：
+    #   * 非图像话题：关节数据、控制指令等
+    #   * RGB 话题：CompressedImage（支持预览）
+    #   * Depth 话题：Image（不预览，只录制）
+    # - 通过 enable_ros2_cameras 控制是否启用相机话题
+    # 
+    # 数据流总结：
+    #   ROS2 → bag 文件（包含所有话题）
+    # 
+    # ==================================================================

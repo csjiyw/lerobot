@@ -23,6 +23,8 @@ import torch
 import torch.nn.functional as F
 from safetensors.torch import load_file
 
+from .rlt_replay_provenance import actor_training_mask
+
 from .rlt_stage2_data import (
     ACTION_CHUNK_FRAME_STRIDE,
     ACTION_CHUNK_TIMEBASE,
@@ -43,6 +45,8 @@ DEFAULT_STAGE2_DISCOUNT = 0.96
 DEFAULT_CRITIC_PER_ACTOR = 4
 DEFAULT_UPDATES_PER_EPISODE = 32
 DEFAULT_MAX_HELDOUT_BC_RATIO = 1.05
+DEFAULT_GRAD_CLIP_NORM = 1.0
+DEFAULT_REF_ANCHOR_WEIGHT = 0.5
 # Fallback weights for direct trainer runs without explicit
 # --q-weight/--bc-weight flags.  The web/pipeline paths always pass explicit
 # values (sourced from RL-Token-SmolVLA/rlt_actor_weights.json).
@@ -116,6 +120,12 @@ def build_parser() -> argparse.ArgumentParser:
         "matching the tuned offline recipe (gated real rows).",
     )
     parser.add_argument(
+        "--grad-clip-norm",
+        type=float,
+        default=DEFAULT_GRAD_CLIP_NORM,
+        help="Maximum Actor/Critic gradient norm. 0 disables clipping.",
+    )
+    parser.add_argument(
         "--q-weight",
         type=float,
         default=None,
@@ -163,12 +173,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ref-anchor-weight",
         type=float,
-        default=0.0,
+        default=DEFAULT_REF_ANCHOR_WEIGHT,
         help=(
             "Extra BC weight pulling the actor output toward the reference VLA "
-            "action on every transition. Default 0.0 keeps the legacy loss. "
-            "Useful in direct-output mode, where nothing else structurally "
-            "anchors the free output to the VLA prior."
+            "action on every transition. The default 0.5 matches the tuned "
+            "always-on reference regularizer."
         ),
     )
     parser.add_argument(
@@ -238,6 +247,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--actor-action-scale",
+        type=float,
+        nargs=7,
+        default=None,
+        metavar="SCALE",
+        help=(
+            "Fixed normalized Actor output bound per action dimension. Use this "
+            "for controlled fresh runs: deriving a new bound from each replay's "
+            "maximum action silently changes the deployed policy class."
+        ),
+    )
+    parser.add_argument(
         "--progress-file",
         type=Path,
         help="Atomically updated JSON progress for the dashboard.",
@@ -271,6 +292,20 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Override the residual composition scale (max action correction) from the Stage 1 config.",
+    )
+    parser.add_argument(
+        "--allow-clipped-reference",
+        action="store_true",
+        help=(
+            "Skip the pre-training check that the actor action scale covers the "
+            "replay reference range. Only for reproducing historical runs: a "
+            "narrower scale truncates the VLA reference at zero residual."
+        ),
+    )
+    parser.add_argument(
+        "--no-bc-target-projection",
+        action="store_true",
+        help="Use raw replay BC targets without residual reachability projection.",
     )
     parser.add_argument(
         "--action-steps",
@@ -331,10 +366,20 @@ def build_parser() -> argparse.ArgumentParser:
             "Remote actor_start_step: the per-episode step where control "
             "hands over from the VLA to the actor (here: block-placement "
             "start step in 30 Hz frames, derived from the 073 gripper data). "
-            "Training analogue: the actor only receives gradients on "
-            "transitions at or after that frame; the critic still learns on "
-            "all transitions. Also stored in the checkpoint as the "
+            "Reference/unknown rows require a verified episode frame at or "
+            "after this point. Recorded Actor and human corrections remain "
+            "eligible regardless of decision density or omitted prefix. "
+            "Also stored in the checkpoint as the "
             "deployment handover point."
+        ),
+    )
+    parser.add_argument(
+        "--actor-frame-gate-strict",
+        action="store_true",
+        help=(
+            "Train the Actor only on rows with a verified episode frame at or "
+            "after --actor-start-step. Use this when deployment is confined to "
+            "a late precision phase and earlier human corrections are out of scope."
         ),
     )
     parser.add_argument(
@@ -590,6 +635,55 @@ def _derive_actor_action_scale(arrays: dict[str, np.ndarray]) -> np.ndarray:
     return scale
 
 
+REFERENCE_REACHABLE_CHANNELS = ("ref_actions", "next_ref_actions", "actions")
+
+
+def _assert_reference_reachable(
+    arrays: dict[str, np.ndarray],
+    scale: np.ndarray,
+    *,
+    allow_clipped: bool = False,
+) -> None:
+    """Refuse to train when the composition would truncate the VLA reference.
+
+    ``compose_actor_action`` clamps ``reference + residual`` to ``±scale``, so a
+    scale narrower than the replay's own action range truncates the reference
+    even at zero residual: the "inherits the VLA" initialisation is a lie, the
+    BC target on those rows is unreachable, and the deployed policy emits a
+    clipped action unrelated to the task.
+    """
+
+    values = np.concatenate(
+        [
+            np.asarray(arrays[name], dtype=np.float32).reshape(-1, arrays[name].shape[-1])
+            for name in REFERENCE_REACHABLE_CHANNELS
+        ],
+        axis=0,
+    )
+    worst = np.abs(values).max(axis=0)
+    offending = np.flatnonzero(worst > scale)
+    if offending.size == 0:
+        return
+    required = _derive_actor_action_scale(arrays)
+    clipped_rows = np.mean(
+        np.any(np.abs(values) > scale, axis=1)
+    ) * 100.0
+    detail = ", ".join(
+        f"dim {int(i)}: |action| up to {worst[i]:.3f} > scale {scale[i]:.3f}"
+        for i in offending
+    )
+    message = (
+        "actor action scale truncates the replay reference channel "
+        f"({clipped_rows:.3f}% of action steps): {detail}. "
+        f"Use --actor-action-scale {' '.join(f'{v:.17g}' for v in required)} "
+        "or pass --allow-clipped-reference to reproduce a historical run."
+    )
+    if allow_clipped:
+        LOG.warning("%s -- continuing because --allow-clipped-reference was set", message)
+        return
+    raise ValueError(message)
+
+
 def _assert_stable_metrics(
     metrics: dict[str, float],
     global_update: int,
@@ -639,7 +733,7 @@ def replay_names(paths: list[Path]) -> set[str]:
 
 
 def load_replay_dataset(
-    paths: list[Path], *, stage1_checkpoint: Path
+    paths: list[Path], *, stage1_checkpoint: Path, discount: float = DEFAULT_STAGE2_DISCOUNT
 ) -> tuple[dict[str, np.ndarray], list[dict[str, Any]]]:
     expected_stage1 = str(stage1_checkpoint.expanduser().resolve())
     parts: dict[str, list[np.ndarray]] = {}
@@ -686,7 +780,7 @@ def load_replay_dataset(
     running_return = 0.0
     for index in range(rewards.size - 1, -1, -1):
         running_return = float(rewards[index]) + (
-            0.0 if bool(dones[index]) else DEFAULT_STAGE2_DISCOUNT * running_return
+            0.0 if bool(dones[index]) else discount ** float(merged["discount_steps"][index, 0]) * running_return
         )
         mc_returns[index] = running_return
     merged["mc_returns"] = mc_returns[:, None]
@@ -809,15 +903,42 @@ def _actor_bc_target_and_mask(
         return batch["actions"], torch.ones_like(batch["is_demo"].bool().squeeze(-1))
     if target_mode != "rlinf_reference_human":
         raise ValueError(f"unknown actor BC target mode: {target_mode!r}")
-    human_or_demo = batch["is_demo"].bool()
+    demo = batch["is_demo"].bool().squeeze(-1)
+    human_steps = torch.zeros_like(batch["actions"][:, :, 0], dtype=torch.bool)
     if replay_human_bc:
-        human_or_demo = human_or_demo | batch["is_intervention"].bool()
-    human_or_demo = human_or_demo.squeeze(-1)
+        if "action_human_mask" in batch:
+            human_steps = batch["action_human_mask"].bool()
+        else:
+            human_steps = batch["is_intervention"].bool().expand_as(human_steps)
+    executed_steps = human_steps | demo[:, None]
     target = torch.where(
-        human_or_demo[:, None, None], batch["actions"], batch["ref_actions"]
+        executed_steps[:, :, None], batch["actions"], batch["ref_actions"]
     )
-    supervised = torch.ones_like(human_or_demo)
+    supervised = torch.ones_like(demo)
     return target, supervised
+
+
+def _reachable_bc_target(
+    target: torch.Tensor,
+    reference: torch.Tensor,
+    action_scale: torch.Tensor,
+    *,
+    output_semantics: str,
+    residual_scale: float,
+) -> torch.Tensor:
+    """Project BC labels into the Actor's physically representable action box."""
+
+    scale = torch.as_tensor(
+        action_scale, dtype=target.dtype, device=target.device
+    ).reshape(1, 1, -1)
+    if output_semantics == RESIDUAL_ACTOR_OUTPUT_SEMANTICS:
+        low = torch.clamp(reference - scale * residual_scale, min=-scale, max=scale)
+        high = torch.clamp(reference + scale * residual_scale, min=-scale, max=scale)
+    elif output_semantics == DIRECT_ACTOR_OUTPUT_SEMANTICS:
+        low, high = -scale, scale
+    else:
+        raise ValueError(f"unsupported actor output semantics: {output_semantics!r}")
+    return torch.clamp(target, min=low, max=high)
 
 
 def _masked_action_mse(
@@ -840,11 +961,16 @@ def _masked_action_mse(
             weights = action_weights.to(error).reshape(1, 1, -1).expand_as(error)
         if sample_weights is not None:
             per_sample = sample_weights.to(error)[supervised].reshape(-1, 1, 1)
-            weights = per_sample if weights is None else weights * per_sample
+            weights = per_sample.expand_as(error) if weights is None else weights * per_sample
         if weights is None:
             return error.mean()
         return (error * weights).sum() / weights.sum().clamp_min(1)
     return predicted.sum() * 0.0
+
+
+def _valid_critic_mse(predicted: torch.Tensor, target: torch.Tensor, valid: torch.Tensor):
+    mask = valid.reshape(-1).bool()
+    return F.mse_loss(predicted[mask], target[mask]) if mask.any() else predicted.sum() * 0.0
 
 
 def _masked_timestep_action_mse(
@@ -874,10 +1000,13 @@ def train_stage2(
     training_phase: str = "actor",
     actor_exploration_std: float = DEFAULT_ACTOR_EXPLORATION_STD,
     actor_exploration_std_per_dim_override: list[float] | None = None,
+    actor_action_scale_override: list[float] | None = None,
+    allow_clipped_reference: bool = False,
     discount: float = DEFAULT_STAGE2_DISCOUNT,
     critic_target_mode: str = "td",
     critic_mc_weight: float = 1.0,
     q_target_clip: float = 1.0,
+    grad_clip_norm: float = DEFAULT_GRAD_CLIP_NORM,
     actor_q_gate: str = "synthetic",
     critic_per_actor: int = DEFAULT_CRITIC_PER_ACTOR,
     balanced_outcomes: bool = True,
@@ -890,7 +1019,7 @@ def train_stage2(
     intervention_bc_weight: float = 1.0,
     replay_human_bc: bool = True,
     syn_bc_mask: int = 0,
-    ref_anchor_weight: float = 0.0,
+    ref_anchor_weight: float = DEFAULT_REF_ANCHOR_WEIGHT,
     ref_anchor_mask: str = "none",
     ref_anchor_box: str = "0.31,0.39,0.30,0.35,0.06,0.13",
     action_stats_path: Path | None = None,
@@ -900,12 +1029,14 @@ def train_stage2(
     critic_lr: float | None = None,
     ref_dropout: float | None = None,
     actor_residual_scale: float | None = None,
+    project_bc_targets: bool = True,
     action_steps: int | None = None,
     utd_ratio: float | None = None,
     warm_up_steps: int | None = None,
     total_steps: int | None = None,
     replay_success_fraction: float = 0.0,
     actor_start_step: int | None = None,
+    actor_frame_gate_strict: bool = False,
     auto_intervention_chunk_rms: float = 0.125,
     auto_intervention_first_action_rms: float = 0.125,
     auto_intervention_max_abs: float = 0.4,
@@ -924,8 +1055,12 @@ def train_stage2(
         raise ValueError("hybrid critic target requires critic_mc_weight > 0")
     if not math.isfinite(q_target_clip) or q_target_clip < 0:
         raise ValueError("q_target_clip must be finite and non-negative")
+    if not math.isfinite(grad_clip_norm) or grad_clip_norm < 0:
+        raise ValueError("grad_clip_norm must be finite and non-negative")
     if actor_q_gate not in {"synthetic", "real-rows"}:
         raise ValueError("actor_q_gate must be synthetic or real-rows")
+    if actor_frame_gate_strict and actor_start_step is None:
+        raise ValueError("actor_frame_gate_strict requires actor_start_step")
     if critic_per_actor <= 0:
         raise ValueError("critic_per_actor must be positive")
     if updates_per_episode <= 0:
@@ -1128,20 +1263,32 @@ def train_stage2(
         config_payload["actor_residual_scale"] = float(actor_residual_scale)
     config = SmolVLARLTConfig(**config_payload)
     arrays, replay_metadata = load_replay_dataset(
-        replay_paths, stage1_checkpoint=stage1_checkpoint
+        replay_paths, stage1_checkpoint=stage1_checkpoint, discount=discount
     )
+    actor_eligible = actor_training_mask(arrays, actor_start_step)
+    if actor_frame_gate_strict:
+        frames = arrays["episode_frame_index"].reshape(-1)
+        actor_eligible &= (frames >= 0) & (frames >= int(actor_start_step))
     replay_root_metadata = _replay_root_for_metadata(replay_paths)
-    if discount != DEFAULT_STAGE2_DISCOUNT:
-        rewards = arrays["rewards"].reshape(-1)
-        dones = arrays["dones"].reshape(-1)
-        mc_returns = np.empty_like(rewards, dtype=np.float32)
-        running_return = 0.0
-        for index in range(rewards.size - 1, -1, -1):
-            running_return = float(rewards[index]) + (
-                0.0 if bool(dones[index]) else float(discount) * running_return
-            )
-            mc_returns[index] = running_return
-        arrays["mc_returns"] = mc_returns[:, None]
+    invalid_count = int((arrays["td_valid"] == 0).sum())
+    replay_integrity = {
+        "provenance_version": "source_and_clock_v1",
+        "critic_valid_transitions": int(arrays["td_valid"].sum()),
+        "bc_only_transitions": invalid_count,
+        "actor_eligible_transitions": int(actor_eligible.sum()),
+        "valid_positive_reward_transitions": int(((arrays["td_valid"] > 0) & (arrays["rewards"] > 0)).sum()),
+        "unknown_source_transitions": int((arrays["action_source"] == 3).sum()),
+    }
+    if invalid_count:
+        LOG.warning(
+            "%d/%d replay rows have unaligned action/next-observation timing; "
+            "retaining their BC targets but excluding Critic and Actor Q gradients. "
+            "Reconstruct aligned transitions before relying on TD learning from human completions.",
+            invalid_count, len(arrays["z_rl"]),
+        )
+    for meta in replay_metadata:
+        if meta.get("provenance_warning"):
+            LOG.warning("%s: %s", meta["path"], meta["provenance_warning"])
     expected = (
         config.rlt_hidden_dim,
         config.state_dim,
@@ -1220,6 +1367,27 @@ def train_stage2(
             initialization.get("stage"),
             actor_init_checkpoint,
         )
+    if actor_action_scale_override is not None:
+        requested_scale = np.asarray(actor_action_scale_override, dtype=np.float32)
+        if (
+            requested_scale.shape != (config.action_dim,)
+            or not np.isfinite(requested_scale).all()
+            or np.any(requested_scale <= 0)
+        ):
+            raise ValueError(
+                f"--actor-action-scale must contain {config.action_dim} positive finite values"
+            )
+        if resume is not None and not np.allclose(
+            actor_action_scale_np, requested_scale, rtol=1e-6, atol=1e-7
+        ):
+            raise ValueError(
+                "cannot change --actor-action-scale when resuming an existing checkpoint"
+            )
+        actor_action_scale_np = requested_scale
+        LOG.info("using fixed actor_action_scale=%s", requested_scale.tolist())
+    _assert_reference_reachable(
+        arrays, actor_action_scale_np, allow_clipped=allow_clipped_reference
+    )
     current_names = replay_names(replay_paths)
     new_names = current_names - trained_replay_names
     new_episodes = len(new_names)
@@ -1373,6 +1541,7 @@ def train_stage2(
         "updates_per_episode": int(updates_per_episode),
         "buffer_transitions": int(arrays["z_rl"].shape[0]),
         "replay_root": replay_root_metadata,
+        "replay_integrity": replay_integrity,
         "batch_size": effective_batch,
         "training_phase": training_phase,
         "q_weight": effective_q_weight,
@@ -1389,6 +1558,7 @@ def train_stage2(
         "discount": float(config.discount),
         "critic_target_mode": critic_target_mode,
         "q_target_clip": q_target_clip,
+        "grad_clip_norm": float(grad_clip_norm),
         "actor_q_gate": actor_q_gate,
         "critic_mc_weight": float(critic_mc_weight),
         "critic_per_actor": int(config.critic_per_actor),
@@ -1407,6 +1577,7 @@ def train_stage2(
         "critic_only_updates": int(critic_only_updates),
         "replay_success_fraction": float(replay_success_fraction),
         "actor_start_step": int(actor_start_step) if actor_start_step is not None else None,
+        "actor_frame_gate_strict": bool(actor_frame_gate_strict),
         "auto_intervention_chunk_rms": float(auto_intervention_chunk_rms),
         "auto_intervention_first_action_rms": float(auto_intervention_first_action_rms),
         "auto_intervention_max_abs": float(auto_intervention_max_abs),
@@ -1442,30 +1613,11 @@ def train_stage2(
         last_progress_write = now
 
     generator = np.random.default_rng(seed + total_updates)
-    # Per-row episode frame index (30 Hz frames since episode start), used by
-    # the actor_start_step gate.  Re-encoded bundles keep the source decision
-    # grid (decision i covers frames i*C .. i*C+C-1); IL bundles are sampled
-    # at decision_stride_frames with no prefix.
-    frame_index_by_row = None
     if actor_start_step is not None:
-        frame_index_by_row = np.zeros(arrays["z_rl"].shape[0], dtype=np.int64)
-        ep_idx_arr = arrays["replay_episode_index"].reshape(-1)
-        for ep_idx, meta in enumerate(replay_metadata):
-            rows = np.flatnonzero(ep_idx_arr == ep_idx)
-            if rows.size == 0:
-                continue
-            stride_frames = int(meta.get("decision_stride_frames") or config.n_action_steps_rl)
-            prefix = int(meta.get("selected_decision_start", 0) or 0)
-            frame_index_by_row[rows] = (
-                np.arange(rows.size, dtype=np.int64) + prefix
-            ) * stride_frames
-        eligible_total = int((frame_index_by_row >= int(actor_start_step)).sum())
         LOG.info(
-            "actor_start_step=%d: %d/%d buffer transitions are at/after the "
-            "handover frame (actor is gated to those; critic trains on all)",
-            actor_start_step,
-            eligible_total,
-            frame_index_by_row.size,
+            "actor_start_step=%d strict=%s: %d/%d Actor-eligible transitions",
+            actor_start_step, actor_frame_gate_strict,
+            int(actor_eligible.sum()), actor_eligible.size,
         )
     last_metrics: dict[str, float] = {}
     last_actor_metrics: dict[str, float] = {}
@@ -1517,14 +1669,15 @@ def train_stage2(
                 )
                 if q_target_clip > 0:
                     target_q = torch.clamp(target_q, 0.0, q_target_clip)
-                td_target = batch["rewards"] + config.discount * (1.0 - batch["dones"]) * target_q
+                td_target = batch["rewards"] + config.discount ** batch["discount_steps"] * (1.0 - batch["dones"]) * target_q
         q1, q2 = critic(batch["z_rl"], batch["state"], batch["actions"])
-        mc_loss = F.mse_loss(q1, batch["mc_returns"]) + F.mse_loss(q2, batch["mc_returns"])
+        critic_valid = batch["td_valid"].bool()
+        mc_loss = _valid_critic_mse(q1, batch["mc_returns"], critic_valid) + _valid_critic_mse(q2, batch["mc_returns"], critic_valid)
         if critic_target_mode == "mc":
             td_loss = mc_loss.detach() * 0.0
             critic_loss = mc_loss
         else:
-            td_loss = F.mse_loss(q1, td_target) + F.mse_loss(q2, td_target)
+            td_loss = _valid_critic_mse(q1, td_target, critic_valid) + _valid_critic_mse(q2, td_target, critic_valid)
             critic_loss = (
                 td_loss
                 if critic_target_mode == "td"
@@ -1532,9 +1685,13 @@ def train_stage2(
                 / (1.0 + float(critic_mc_weight))
             )
         critic_optimizer.zero_grad(set_to_none=True)
-        critic_loss.backward()
-        torch.nn.utils.clip_grad_norm_(critic.parameters(), 10.0)
-        critic_optimizer.step()
+        if critic_valid.any():
+            critic_loss.backward()
+            if grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    critic.parameters(), float(grad_clip_norm)
+                )
+            critic_optimizer.step()
 
         global_update = total_updates + update_index + 1
         # Warm-up analogue of the remote warm_up_steps: during the first
@@ -1546,13 +1703,8 @@ def train_stage2(
             and global_update % int(config.critic_per_actor) == 0
         )
         if actor_step_allowed and actor_start_step is not None:
-            # Offline analogue of the remote per-episode actor_start_step:
-            # the actor only receives gradients on transitions at/after the
-            # handover frame; before that the VLA is trusted (passthrough).
-            start_rows = np.flatnonzero(
-                frame_index_by_row[indices] >= int(actor_start_step)
-            )
-            if start_rows.size < 8:
+            start_rows = np.flatnonzero(actor_eligible[indices])
+            if start_rows.size == 0:
                 actor_step_allowed = False
             elif start_rows.size < batch["z_rl"].shape[0]:
                 sel = torch.as_tensor(start_rows, device=target_device)
@@ -1602,13 +1754,10 @@ def train_stage2(
             # away from the reference on clean frames.  On synthetic rows the
             # corr/bad reward contrast teaches the corrective pullback.
             syn_mask = batch.get("is_synthetic")
+            q_mask = batch["td_valid"].reshape(-1).bool()
             if actor_q_gate == "synthetic" and syn_mask is not None:
-                m = syn_mask.reshape(-1).bool()
-                q_loss = -q_value.reshape(-1)[m].mean() if m.any() else q_value.sum() * 0.0
-            else:
-                # Tuned recipe (real-rows) or synthetic-mode buffer with
-                # no synthetic flag column: Q-max on the full batch.
-                q_loss = -q_value.mean()
+                q_mask = q_mask & syn_mask.reshape(-1).bool()
+            q_loss = -q_value.reshape(-1)[q_mask].mean() if q_mask.any() else q_value.sum() * 0.0
             bc_target, bc_supervised = _actor_bc_target_and_mask(
                 batch,
                 replay_human_bc=replay_human_bc,
@@ -1628,13 +1777,39 @@ def train_stage2(
                     & bool(replay_human_bc)
                 )
                 bc_sample_weights[intervention_mask] = float(intervention_bc_weight)
+            reachable_target = (
+                _reachable_bc_target(
+                    bc_target,
+                    batch["ref_actions"],
+                    actor_action_scale,
+                    output_semantics=semantics,
+                    residual_scale=config.actor_residual_scale,
+                )
+                if project_bc_targets
+                else bc_target
+            )
             replay_bc_loss = _masked_action_mse(
                 sampled_action,
-                bc_target,
+                reachable_target,
                 bc_supervised,
                 bc_action_weights,
                 sample_weights=bc_sample_weights,
             )
+            # Keep the discarded, unreachable residual as a diagnostic.
+            with torch.no_grad():
+                bc_floor = _masked_action_mse(
+                    reachable_target,
+                    bc_target,
+                    bc_supervised,
+                    bc_action_weights,
+                    sample_weights=bc_sample_weights,
+                )
+                reachable_changed = (
+                    (reachable_target - bc_target).abs().amax(dim=-1) > 1e-7
+                )
+                bc_target_clipped_fraction = float(
+                    reachable_changed.float().mean().cpu()
+                )
             il_anchor_loss = sampled_action.sum() * 0.0
             if il_anchor_cache is not None and il_anchor_indices is not None:
                 anchor_rows = generator.choice(
@@ -1726,14 +1901,23 @@ def train_stage2(
             )
             actor_optimizer.zero_grad(set_to_none=True)
             actor_loss.backward()
-            torch.nn.utils.clip_grad_norm_(actor.parameters(), 10.0)
+            if grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    actor.parameters(), float(grad_clip_norm)
+                )
             actor_optimizer.step()
             actor_updates += 1
             last_actor_metrics = {
                 "actor_loss": float(actor_loss.detach().cpu()),
                 "q_loss": float(q_loss.detach().cpu()),
+                "q_supervised_fraction": float(q_mask.float().mean().detach().cpu()),
                 "bc_loss": float(bc_loss.detach().cpu()),
                 "replay_bc_loss": float(replay_bc_loss.detach().cpu()),
+                "replay_bc_reachability_floor": float(bc_floor.cpu()),
+                "replay_bc_target_clipped_fraction": (
+                    bc_target_clipped_fraction if project_bc_targets else 0.0
+                ),
+                "bc_target_projection_enabled": bool(project_bc_targets),
                 "il_anchor_loss": float(il_anchor_loss.detach().cpu()),
                 "bc_supervised_fraction": float(
                     bc_supervised.float().mean().detach().cpu()
@@ -1754,6 +1938,7 @@ def train_stage2(
             "critic_loss": float(critic_loss.detach().cpu()),
             "critic_td_loss": float(td_loss.detach().cpu()),
             "critic_mc_loss": float(mc_loss.detach().cpu()),
+            "critic_valid_fraction": float(critic_valid.float().mean().detach().cpu()),
             "q1_mean": float(q1.mean().detach().cpu()),
             "q2_mean": float(q2.mean().detach().cpu()),
             **last_actor_metrics,
@@ -1915,6 +2100,7 @@ def train_stage2(
             "bc_weight": effective_bc_weight,
             "critic_target_mode": critic_target_mode,
             "q_target_clip": q_target_clip,
+            "grad_clip_norm": float(grad_clip_norm),
             "actor_q_gate": actor_q_gate,
             "critic_mc_weight": float(critic_mc_weight),
             **last_metrics,
@@ -1946,6 +2132,7 @@ def train_stage2(
         "buffer_transitions": int(arrays["z_rl"].shape[0]),
         "replay_root": replay_root_metadata,
         "trained_replay_names": sorted(current_names),
+        "replay_integrity": replay_integrity,
         "history": history[-200:],
         "last_metrics": last_metrics,
         "saved_at_ns": time.time_ns(),
@@ -1968,6 +2155,7 @@ def train_stage2(
         "ref_anchor_box": ref_anchor_box,
         "critic_target_mode": critic_target_mode,
         "q_target_clip": q_target_clip,
+        "grad_clip_norm": float(grad_clip_norm),
         "actor_q_gate": actor_q_gate,
         "critic_mc_weight": float(critic_mc_weight),
         "balanced_outcomes": bool(balanced_outcomes),
@@ -1989,6 +2177,7 @@ def train_stage2(
         "critic_only_updates": int(critic_only_updates),
         "replay_success_fraction": float(replay_success_fraction),
         "actor_start_step": int(actor_start_step) if actor_start_step is not None else None,
+        "actor_frame_gate_strict": bool(actor_frame_gate_strict),
         "auto_intervention_chunk_rms": float(auto_intervention_chunk_rms),
         "auto_intervention_first_action_rms": float(auto_intervention_first_action_rms),
         "auto_intervention_max_abs": float(auto_intervention_max_abs),
@@ -2000,6 +2189,7 @@ def train_stage2(
     _atomic_torch_save(checkpoint, latest)
     summary = {
         "stage": "rlt_stage2",
+        "replay_integrity": replay_integrity,
         "actor_output_semantics": semantics,
         "action_chunk_timebase": ACTION_CHUNK_TIMEBASE,
         "checkpoint": str(versioned),
@@ -2028,6 +2218,7 @@ def train_stage2(
         "bc_action_weights": bc_action_weights_np.tolist(),
         "critic_target_mode": critic_target_mode,
         "q_target_clip": q_target_clip,
+        "grad_clip_norm": float(grad_clip_norm),
         "actor_q_gate": actor_q_gate,
         "critic_mc_weight": float(critic_mc_weight),
         "balanced_outcomes": bool(balanced_outcomes),
@@ -2044,6 +2235,7 @@ def train_stage2(
         "critic_only_updates": int(critic_only_updates),
         "replay_success_fraction": float(replay_success_fraction),
         "actor_start_step": int(actor_start_step) if actor_start_step is not None else None,
+        "actor_frame_gate_strict": bool(actor_frame_gate_strict),
         "auto_intervention_chunk_rms": float(auto_intervention_chunk_rms),
         "auto_intervention_first_action_rms": float(auto_intervention_first_action_rms),
         "auto_intervention_max_abs": float(auto_intervention_max_abs),
@@ -2097,10 +2289,13 @@ def main() -> None:
             training_phase=args.training_phase,
             actor_exploration_std=args.actor_exploration_std,
             actor_exploration_std_per_dim_override=args.actor_exploration_std_per_dim,
+            actor_action_scale_override=args.actor_action_scale,
+            allow_clipped_reference=args.allow_clipped_reference,
             discount=args.discount,
             critic_target_mode=args.critic_target_mode,
             critic_mc_weight=args.critic_mc_weight,
             q_target_clip=args.q_target_clip,
+            grad_clip_norm=args.grad_clip_norm,
             actor_q_gate=args.actor_q_gate,
             critic_per_actor=args.critic_per_actor,
             balanced_outcomes=args.balanced_outcomes,
@@ -2123,12 +2318,14 @@ def main() -> None:
             critic_lr=args.critic_lr,
             ref_dropout=args.ref_dropout,
             actor_residual_scale=args.actor_residual_scale,
+            project_bc_targets=not args.no_bc_target_projection,
             action_steps=args.action_steps,
             utd_ratio=args.utd_ratio,
             warm_up_steps=args.warm_up_steps,
             total_steps=args.total_steps,
             replay_success_fraction=args.replay_success_fraction,
             actor_start_step=args.actor_start_step,
+            actor_frame_gate_strict=args.actor_frame_gate_strict,
             auto_intervention_chunk_rms=args.auto_intervention_chunk_rms,
             auto_intervention_first_action_rms=args.auto_intervention_first_action_rms,
             auto_intervention_max_abs=args.auto_intervention_max_abs,

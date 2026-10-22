@@ -215,10 +215,10 @@ def main() -> None:
         with h5py.File(decision, "r") as source:
             if not bool(source.attrs.get("completed", False)):
                 raise ValueError(f"unfinished decision log: {decision}")
-            if int(source.attrs["action_steps"]) != 10:
+            if int(source.attrs["action_steps"]) not in (10, 20):
                 raise ValueError(
                     f"{decision.name} has action_steps={source.attrs['action_steps']}; "
-                    "RLinf reproduction requires a 10-tick Stage-2 decision log"
+                    "supported Stage-2 decision horizons are 10 or 20 ticks"
                 )
             raw = _raw_path(source, decision, args.raw_root.expanduser().resolve())
             with h5py.File(raw, "r") as archive:

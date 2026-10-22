@@ -56,7 +56,7 @@ def parser() -> argparse.ArgumentParser:
         "(independent full action). Must match the selected actor lineage.",
     )
     value.add_argument(
-        "--ref-anchor-weight", type=float, default=0.0,
+        "--ref-anchor-weight", type=float, default=0.5,
         help="Weight of the reference-anchor (actor -> VLA reference) loss term.",
     )
     value.add_argument(

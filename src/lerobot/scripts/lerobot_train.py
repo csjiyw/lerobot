@@ -29,7 +29,7 @@ from tqdm import tqdm
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.factory import make_dataset
-from lerobot.datasets.sampler import EpisodeAwareSampler
+from lerobot.datasets.sampler import ConsecutiveFrameBatchSampler, EpisodeAwareSampler, GroupWeightedBatchSampler
 from lerobot.datasets.transforms import ImageTransforms
 from lerobot.datasets.utils import cycle
 from lerobot.envs.factory import make_env, make_env_pre_post_processors
@@ -292,22 +292,29 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if cfg.policy.pretrained_path is not None and not uses_relative_eef_actions:
         processor_kwargs["preprocessor_overrides"] = {
             "device_processor": {"device": device.type},
-            "normalizer_processor": {
+        }
+        if not cfg.inherit_pretrained_processors:
+            processor_kwargs["preprocessor_overrides"]["normalizer_processor"] = {
                 "stats": dataset.meta.stats,
                 "features": {**policy.config.input_features, **policy.config.output_features},
                 "norm_map": policy.config.normalization_mapping,
-            },
-        }
-        processor_kwargs["preprocessor_overrides"]["rename_observations_processor"] = {
-            "rename_map": cfg.rename_map
-        }
-        postprocessor_kwargs["postprocessor_overrides"] = {
-            "unnormalizer_processor": {
-                "stats": dataset.meta.stats,
-                "features": policy.config.output_features,
-                "norm_map": policy.config.normalization_mapping,
-            },
-        }
+            }
+            postprocessor_kwargs["postprocessor_overrides"] = {
+                "unnormalizer_processor": {
+                    "stats": dataset.meta.stats,
+                    "features": policy.config.output_features,
+                    "norm_map": policy.config.normalization_mapping,
+                },
+            }
+        elif is_main_process:
+            logging.info(
+                "Fine-tuning inherits the checkpoint's saved pre/post processors "
+                "and normalization statistics; new dataset statistics remain unchanged in metadata."
+            )
+        if cfg.rename_map or not cfg.inherit_pretrained_processors:
+            processor_kwargs["preprocessor_overrides"]["rename_observations_processor"] = {
+                "rename_map": cfg.rename_map
+            }
 
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,
@@ -408,16 +415,49 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         shuffle = True
         sampler = None
 
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        num_workers=cfg.num_workers,
-        batch_size=cfg.batch_size,
-        shuffle=shuffle and not cfg.dataset.streaming,
-        sampler=sampler,
-        pin_memory=device.type == "cuda",
-        drop_last=False,
-        prefetch_factor=2 if cfg.num_workers > 0 else None,
-    )
+    if not 1 <= cfg.consecutive_frames_per_sample <= cfg.batch_size:
+        raise ValueError("consecutive_frames_per_sample must be in [1, batch_size]")
+    loader_kwargs = dict(num_workers=cfg.num_workers, pin_memory=device.type == "cuda",
+                         prefetch_factor=2 if cfg.num_workers > 0 else None)
+    if cfg.dataset.group_weights_json:
+        if cfg.dataset.streaming or dataset.episodes is not None:
+            raise ValueError("group-weighted sampling requires the full non-streaming dataset")
+        import json as _json
+        from pathlib import Path as _P
+
+        weights_path = _P(cfg.dataset.group_weights_json)
+        payload = _json.loads(weights_path.read_text())
+        weights = payload["weights"] if isinstance(payload.get("weights"), dict) else payload
+        env_groups = _json.loads((weights_path.parent / "env_groups.json").read_text())
+        eps_df = dataset.meta.episodes
+        groups = [env_groups[str(int(e))] for e in eps_df["episode_index"]]
+        if cfg.consecutive_frames_per_sample > 1:
+            dataset.batch_video_decode = True
+        batch_sampler = GroupWeightedBatchSampler(
+            eps_df["dataset_from_index"], eps_df["dataset_to_index"], groups, weights,
+            cfg.batch_size, cfg.consecutive_frames_per_sample,
+            drop_n_last_frames=getattr(cfg.policy, "drop_n_last_frames", 0), seed=cfg.seed or 0,
+        )
+        dataloader = torch.utils.data.DataLoader(dataset, batch_sampler=batch_sampler, **loader_kwargs)
+        logging.info("Group-weighted sampling: weights=%s block=%d group_frames=%s", weights,
+                     cfg.consecutive_frames_per_sample, batch_sampler.group_frames)
+    elif cfg.consecutive_frames_per_sample > 1:
+        if cfg.dataset.streaming or not hasattr(dataset, "_query_videos") or dataset.episodes is not None:
+            raise ValueError("consecutive-frame sampling currently requires a full non-streaming LeRobotDataset")
+        dataset.batch_video_decode = True
+        batch_sampler = ConsecutiveFrameBatchSampler(
+            dataset.meta.episodes["dataset_from_index"], dataset.meta.episodes["dataset_to_index"],
+            cfg.batch_size, cfg.consecutive_frames_per_sample,
+            drop_n_last_frames=getattr(cfg.policy, "drop_n_last_frames", 0),
+        )
+        dataloader = torch.utils.data.DataLoader(dataset, batch_sampler=batch_sampler, **loader_kwargs)
+        logging.info("Consecutive frame sampling: block=%d batch=%d, shared video decode enabled",
+                     cfg.consecutive_frames_per_sample, cfg.batch_size)
+    else:
+        dataloader = torch.utils.data.DataLoader(
+            dataset, batch_size=cfg.batch_size, shuffle=shuffle and not cfg.dataset.streaming,
+            sampler=sampler, drop_last=False, **loader_kwargs,
+        )
 
     # Prepare everything with accelerator
     accelerator.wait_for_everyone()
@@ -493,7 +533,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             if wandb_logger:
                 wandb_log_dict = train_tracker.to_dict()
                 if output_dict:
-                    wandb_log_dict.update(output_dict)
+                    # Convert any lazy (detached) tensors to floats here, at log
+                    # time, so the training loop itself stays sync-free.
+                    wandb_log_dict.update(
+                        {k: (v.item() if torch.is_tensor(v) else v) for k, v in output_dict.items()}
+                    )
                 # Log RA-BC statistics if enabled
                 if rabc_weights is not None:
                     rabc_stats = rabc_weights.get_stats()

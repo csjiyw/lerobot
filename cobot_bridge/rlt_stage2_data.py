@@ -21,10 +21,14 @@ import h5py
 import numpy as np
 import torch
 
+from .rlt_replay_provenance import (
+    PROVENANCE_FIELDS, decision_provenance, enrich_replay_provenance,
+)
+
 
 DECISION_FORMAT = "cobot_magic_rlt_decisions_v1"
 REPLAY_FORMAT = "cobot_magic_rlt_replay_v1"
-ACTION_SOURCE_NAMES = {"reference": 0, "actor": 1, "human": 2}
+ACTION_SOURCE_NAMES = {"reference": 0, "actor": 1, "human": 2, "unknown": 3}
 OUTCOMES = {"failure": 0, "success": 1, "aborted": 2}
 COLLECTION_PHASES = ("warmup", "actor", "reference")
 DEFAULT_WARMUP_EPISODES = 5
@@ -309,6 +313,9 @@ class RLTDecisionWriter:
             "bridge_sequence": self.file.create_dataset(
                 "bridge_sequence", shape=(0,), maxshape=(None,), dtype="i8", chunks=True
             ),
+            "episode_frame_index": self.file.create_dataset(
+                "episode_frame_index", shape=(0,), maxshape=(None,), dtype="i8", chunks=True
+            ),
             "z_rl": self.file.create_dataset(
                 "z_rl", shape=(0, d.z_dim), maxshape=(None, d.z_dim), dtype="f4", chunks=True
             ),
@@ -346,6 +353,13 @@ class RLTDecisionWriter:
             "is_intervention": self.file.create_dataset(
                 "is_intervention", shape=(0,), maxshape=(None,), dtype="u1", chunks=True
             ),
+            "action_human_mask": self.file.create_dataset(
+                "action_human_mask",
+                shape=(0, d.action_steps),
+                maxshape=(None, d.action_steps),
+                dtype="u1",
+                chunks=True,
+            ),
         }
         if self.sent_action_steps is not None:
             self.datasets["sent_actions_raw"] = self.file.create_dataset(
@@ -367,8 +381,10 @@ class RLTDecisionWriter:
         sent_actions_raw: Any | None = None,
         action_source: str,
         is_intervention: bool,
+        action_human_mask: Any | None = None,
         bridge_sequence: int = -1,
         time_ns: int | None = None,
+        episode_frame_index: int = -1,
     ) -> None:
         if action_source not in ACTION_SOURCE_NAMES:
             raise ValueError(f"invalid action_source: {action_source!r}")
@@ -377,9 +393,22 @@ class RLTDecisionWriter:
         if self.workflow_mode == 1 and is_intervention:
             raise ValueError("Mode 1 cannot store human intervention decisions")
         d = self.dimensions
+        if action_human_mask is None:
+            human_mask = np.full((d.action_steps,), bool(is_intervention), dtype=np.uint8)
+        else:
+            human_mask = np.asarray(action_human_mask, dtype=np.uint8)
+            if human_mask.shape != (d.action_steps,) or not np.isin(human_mask, [0, 1]).all():
+                raise ValueError(
+                    f"action_human_mask must be binary with shape {(d.action_steps,)}"
+                )
+            if bool(human_mask.any()) != bool(is_intervention):
+                raise ValueError(
+                    "is_intervention must match whether action_human_mask contains human steps"
+                )
         values = {
             "time_ns": time.time_ns() if time_ns is None else int(time_ns),
             "bridge_sequence": int(bridge_sequence),
+            "episode_frame_index": int(episode_frame_index),
             "z_rl": _finite_array(z_rl, (d.z_dim,), "z_rl"),
             "state": _finite_array(state, (d.state_dim,), "state"),
             "reference_actions": _finite_array(
@@ -393,6 +422,7 @@ class RLTDecisionWriter:
             ),
             "action_source": ACTION_SOURCE_NAMES[action_source],
             "is_intervention": int(is_intervention),
+            "action_human_mask": human_mask,
         }
         if self.sent_action_steps is not None:
             if sent_actions_raw is None:
@@ -724,6 +754,11 @@ def build_replay_bundle(
             "dones": dones,
             "is_intervention": is_intervention[:, None],
             "is_demo": np.zeros((transition_count, 1), dtype=np.float32),
+            "action_human_mask": (
+                source["action_human_mask"][start : end - 1].astype(np.float32)
+                if "action_human_mask" in source
+                else np.repeat(is_intervention[:, None], int(source.attrs["action_steps"]), axis=1)
+            ),
         }
         metadata = {
             "format": REPLAY_FORMAT,
@@ -736,6 +771,7 @@ def build_replay_bundle(
             "outcome": outcome,
             "transition_count": transition_count,
             "intervention_transitions": int(is_intervention.sum()),
+            "human_action_steps": int(arrays["action_human_mask"].sum()),
             "action_source_counts": source_counts,
             "source_decisions": count,
             "selected_decision_start": start,
@@ -764,6 +800,11 @@ def build_replay_bundle(
                 float(terminal_failure_reward) if recap_trace is not None else 0.0
             ),
         }
+        provenance, audit = decision_provenance(source, start, end)
+        if recap_trace is not None:
+            provenance["discount_steps"][:] = 1.0
+        arrays.update(provenance)
+        metadata.update(audit)
         if recap_trace is not None:
             metadata["recap_value_current_min"] = float(recap_trace[start : end - 1].min())
             metadata["recap_value_current_max"] = float(recap_trace[start : end - 1].max())
@@ -814,9 +855,33 @@ def load_replay_bundle(path: Path) -> tuple[dict[str, np.ndarray], dict[str, Any
             arrays["is_synthetic"] = np.asarray(bundle["is_synthetic"], dtype=np.float32)
         else:
             arrays["is_synthetic"] = np.zeros_like(arrays["is_intervention"])
+        if "action_human_mask" in bundle.files:
+            arrays["action_human_mask"] = np.asarray(
+                bundle["action_human_mask"], dtype=np.float32
+            )
+        else:
+            action_steps = int(metadata["action_steps"])
+            arrays["action_human_mask"] = np.repeat(
+                arrays["is_intervention"], action_steps, axis=1
+            )
+        for name in PROVENANCE_FIELDS:
+            if name in bundle.files:
+                arrays[name] = np.asarray(bundle[name], dtype=np.float32)
+    enrich_replay_provenance(arrays, metadata, path)
     count = int(metadata["transition_count"])
     if any(array.shape[0] != count for array in arrays.values()):
         raise ValueError(f"inconsistent replay array lengths in {path}")
+    for name in PROVENANCE_FIELDS:
+        if arrays[name].shape != (count, 1) or not np.isfinite(arrays[name]).all():
+            raise ValueError(f"invalid replay provenance {name} in {path}")
+    if np.any(arrays["discount_steps"] <= 0):
+        raise ValueError(f"discount_steps must be positive in {path}")
+    if not np.isin(arrays["td_valid"], [0, 1]).all():
+        raise ValueError(f"td_valid must be binary in {path}")
+    if arrays["action_human_mask"].shape != (count, int(metadata["action_steps"])):
+        raise ValueError(f"invalid action_human_mask shape in {path}")
+    if not np.isin(arrays["action_human_mask"], [0, 1]).all():
+        raise ValueError(f"action_human_mask must be binary in {path}")
     return arrays, metadata
 
 

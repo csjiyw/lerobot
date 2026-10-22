@@ -11,9 +11,11 @@ import argparse
 import asyncio
 import fcntl
 import json
+import math
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -24,15 +26,17 @@ from pathlib import Path
 from typing import Any, Literal
 
 import h5py
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
-from .client import CobotBridgeClient
+from .client import CobotBridgeClient, request_robot_safe_stop
 from .cobot_mjpeg_cam_server import BOUNDARY as MJPEG_BOUNDARY
 from .cobot_mjpeg_cam_server import BridgeJpegPump
 from .debug_capture import DebugCaptureWorker, DebugSession
+from .dashboard_events import DashboardEvents
+from .lerobot_replay import export_episode_to_raw
 from .move_init_pose import DEFAULT_JOINT_SPEED, DEFAULT_MIN_SECONDS
 from .policy_client import PersistentPolicyClient, PolicyServerError
 from .rlt_policy_client import PersistentRLTPolicyClient, RLTPolicyServerError
@@ -47,6 +51,12 @@ from .rlt_stage2_data import (
 
 
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+GROOT_EEF_POLICY_ID = "external/groot_5482b_eef_90000"
+DEFAULT_GROOT_EEF_CHECKPOINT = Path(
+    "/home/fuxin/models/jyw/Longwu0622/"
+    "5482b62ee3ff498a92f139f0788c0544_head_eef_joint/STEP1-eef/checkpoint-90000"
+)
+DEFAULT_GROOT_BACKBONE = Path("/home/fuxin/models/GR00T/nvidia/Cosmos-Reason2-2B")
 MOTION_JOB_KINDS = {
     "replay_execute",
     "policy_execute",
@@ -55,6 +65,7 @@ MOTION_JOB_KINDS = {
     "init_pose_execute",
 }
 RECORD_JOB_KINDS = {"record", "record_with_init"}
+STARTUP_JOB_KINDS = {"robot_startup", "robot_self_check", "device_restart"}
 CAMERA_NAMES = ("front", "left", "right")
 ARM_ROLES = ("master", "puppet")
 ARM_SIDES = ("left", "right")
@@ -68,6 +79,7 @@ class DashboardConfig:
     checkpoint_root: Path
     run_root: Path
     python: Path
+    lerobot_replay_root: Path = Path.home() / "datasets" / "lerobot_v21"
     debug_root: Path = Path("debug_rollouts")
     debug_capture_enabled: bool = True
     rlt_root: Path = Path("../RL-Token-SmolVLA")
@@ -82,6 +94,8 @@ class DashboardConfig:
     robot_control_workspace: Path = Path("/home/agilex/lerobot")
     robot_python: Path = Path("/home/agilex/miniforge3/envs/smolvla_robot/bin/python")
     groot_python: Path = Path("/home/fuxin/anaconda3/envs/groot_n1d7_web/bin/python")
+    groot_eef_checkpoint_path: Path | None = None
+    groot_backbone_path: Path | None = None
     api_token: str = ""
     pc_preview_fps: int = 15
     robot_sudo_password_file: Path | None = None
@@ -99,6 +113,12 @@ class DashboardConfig:
             ),
             run_root=Path(os.environ.get("COBOT_WEB_RUN_ROOT", project_root / "web_runs")),
             python=Path(os.environ.get("COBOT_PYTHON", sys.executable)),
+            lerobot_replay_root=Path(
+                os.environ.get(
+                    "COBOT_LEROBOT_REPLAY_ROOT",
+                    Path.home() / "datasets" / "lerobot_v21",
+                )
+            ).expanduser(),
             debug_root=Path(
                 os.environ.get("COBOT_DEBUG_CAPTURE_ROOT", project_root / "debug_rollouts")
             ),
@@ -146,6 +166,29 @@ class DashboardConfig:
                     "/home/fuxin/anaconda3/envs/groot_n1d7_web/bin/python",
                 )
             ),
+            groot_eef_checkpoint_path=(
+                Path(
+                    os.environ.get(
+                        "COBOT_GROOT_EEF_CHECKPOINT",
+                        str(DEFAULT_GROOT_EEF_CHECKPOINT),
+                    )
+                ).expanduser()
+                if os.environ.get(
+                    "COBOT_GROOT_EEF_CHECKPOINT", str(DEFAULT_GROOT_EEF_CHECKPOINT)
+                ).strip()
+                else None
+            ),
+            groot_backbone_path=(
+                Path(
+                    os.environ.get(
+                        "COBOT_GROOT_BACKBONE_PATH", str(DEFAULT_GROOT_BACKBONE)
+                    )
+                ).expanduser()
+                if os.environ.get(
+                    "COBOT_GROOT_BACKBONE_PATH", str(DEFAULT_GROOT_BACKBONE)
+                ).strip()
+                else None
+            ),
             api_token=os.environ.get("COBOT_WEB_TOKEN", ""),
             pc_preview_fps=max(1, min(60, int(os.environ.get("COBOT_PC_PREVIEW_FPS", "15")))),
             robot_sudo_password_file=(
@@ -190,6 +233,11 @@ class ManagedJob:
         pipeline_status_file = metadata.get("pipeline_status_file")
         if pipeline_status_file:
             metadata["pipeline"] = _read_rlt_pipeline_status(Path(pipeline_status_file))
+        if metadata.get("startup_report_file"):
+            try:
+                metadata["startup_report"] = json.loads(Path(metadata["startup_report_file"]).read_text())
+            except (OSError, ValueError):
+                metadata["startup_report"] = {"phase": "queued"}
         return {
             "id": self.id,
             "kind": self.kind,
@@ -231,6 +279,16 @@ class JobManager:
     ) -> dict[str, Any]:
         with self._lock:
             active = [job for job in self._jobs.values() if job.process.poll() is None]
+            if kind in STARTUP_JOB_KINDS and any(job.kind in STARTUP_JOB_KINDS for job in active):
+                raise RuntimeError("a robot startup/check/recovery job is already running")
+            if kind in {"robot_startup", "robot_self_check"} and any(
+                job.kind in RECORD_JOB_KINDS or self._has_active_motion(job) for job in active
+            ):
+                raise RuntimeError("finish recording and motion before robot startup/check")
+            if (kind in MOTION_JOB_KINDS or kind in RECORD_JOB_KINDS) and any(
+                job.kind in STARTUP_JOB_KINDS for job in active
+            ):
+                raise RuntimeError("wait for robot startup/check/recovery to finish")
             if kind in RECORD_JOB_KINDS and any(job.kind in RECORD_JOB_KINDS for job in active):
                 raise RuntimeError("a recorder job is already running")
             if kind == "policy_server" and any(job.kind == "policy_server" for job in active):
@@ -304,6 +362,10 @@ class JobManager:
             job.stop_requested = True
             process = job.process
 
+        if job.kind in MOTION_JOB_KINDS:
+            safety = request_robot_safe_stop(self.config.endpoint, timeout_s=0.5)
+            with self._lock:
+                job.metadata["stop_safety"] = safety
         try:
             os.killpg(process.pid, signal.SIGINT)
         except ProcessLookupError:
@@ -376,6 +438,9 @@ class DeviceMonitor:
         self._lock = threading.Lock()
         self._images: dict[str, bytes] = {}
         self._image_types: dict[str, str] = {}
+        self._joint_cache: dict[str, Any] | None = None
+        self._joint_cached_at = 0.0
+        self._joint_revision = 0
 
     @staticmethod
     def _media_type(encoding: str) -> str:
@@ -429,6 +494,55 @@ class DeviceMonitor:
             if data is None:
                 return None
             return data, self._image_types.get(name, "image/jpeg")
+
+    def control_status(self) -> dict[str, Any]:
+        """Lightweight discrete status only, independent of overview and JPEGs."""
+        try:
+            with CobotBridgeClient(self.config.endpoint, timeout_s=0.3) as client:
+                ping = client.ping()
+                raw, _ = client.get_observation(sides=ARM_SIDES, images=())
+            control = raw.get('control') or {}
+            devices = _device_status(raw, {})
+            # Same observation as the status probe. Cache for low-rate display;
+            # browsers must not issue another robot request to read joint angles.
+            with self._lock:
+                self._joint_revision += 1
+                self._joint_cached_at = time.monotonic()
+                self._joint_cache = {
+                    'revision': self._joint_revision,
+                    'bridge_time_ns': raw.get('bridge_time_ns'),
+                    'arms': {k: {n: v[n] for n in ('position', 'fresh', 'age_ms')}
+                             for k, v in devices['arms'].items()},
+                }
+            # Remove all continuously varying fields: joint positions, frame
+            # counters, timestamps, ages and JPEG sizes must not generate events.
+            return {
+                'online': True, 'allow_control': bool(ping.get('allow_control', False)) and all(
+                    control.get(k) is not None for k in ('effective_mode', 'teach_active', 'output_enabled', 'emergency_latched')),
+                'mode': control.get('effective_mode'), 'mode_id': control.get('effective_mode_id'),
+                'teach_active': control.get('teach_active'),
+                'output_enabled': control.get('output_enabled'),
+                'emergency_latched': control.get('emergency_latched'),
+                'epoch': control.get('epoch'), 'ready': bool(raw.get('ready')),
+                'devices': {'ok': devices['ok'], 'ok_count': devices['ok_count'], 'total': 7,
+                            'arms': {k: {n: v[n] for n in ('ok', 'fresh')} for k, v in devices['arms'].items()},
+                            'cameras': {k: {n: v[n] for n in ('ok', 'fresh', 'has_frame')} for k, v in devices['cameras'].items()}},
+            }
+        except Exception:
+            return {'online': False, 'devices': {'ok': False, 'ok_count': 0, 'total': 7,
+                    'arms': {f'{r}_{s}': {'ok': False, 'fresh': False} for r in ARM_ROLES for s in ARM_SIDES},
+                    'cameras': {n: {'ok': False, 'fresh': False, 'has_frame': False} for n in CAMERA_NAMES}}}
+
+    def joint_state(self) -> dict[str, Any]:
+        """Read local latest-value cache only; no bridge I/O or directory scan."""
+        with self._lock:
+            if self._joint_cache is None:
+                return {'revision': 0, 'age_ms': None, 'arms': {}}
+            elapsed_ms = max(0., (time.monotonic() - self._joint_cached_at) * 1000)
+            return {**self._joint_cache, 'age_ms': round(elapsed_ms, 1),
+                    'arms': {k: {**v, 'age_ms': round(float(v['age_ms'] or 0) + elapsed_ms, 1),
+                                  'fresh': bool(v['fresh'] and elapsed_ms <= 1500)}
+                             for k, v in self._joint_cache['arms'].items()}}
 
 
 class DashboardMjpegRelay:
@@ -538,6 +652,18 @@ class ReplayRequest(BaseModel):
     confirm_motion: bool = False
 
 
+class LerobotReplayRequest(BaseModel):
+    dataset_id: str
+    episode_index: int = Field(default=0, ge=0)
+    side: Literal["left", "right"] = "right"
+    waypoint_hz: int = Field(default=30, ge=1, le=200)
+    speed_scale: float = Field(default=0.5, gt=0, le=1.0)
+    alignment_speed: float = Field(default=0.05, gt=0, le=0.12)
+    alignment_min_seconds: float = Field(default=5.0, gt=0, le=30.0)
+    execute: bool = False
+    confirm_motion: bool = False
+
+
 class PolicyRequest(BaseModel):
     task: str = Field(min_length=1, max_length=300)
     side: Literal["left", "right"] = "right"
@@ -559,15 +685,35 @@ class PolicyServerRequest(BaseModel):
     device: str = "cuda:0"
     compute: Literal["pc", "robot"] = "pc"
     inference_chunking: Literal["original", "guided_rtc"] = "original"
+    num_steps: Literal[5, 10, 20] | None = None
+    residual_actor: str | None = None
+    z_encoder: str | None = None
 
 
 class FinalizeRecordRequest(BaseModel):
     outcome: Literal["success", "failure"]
 
 
+class InterventionPhaseRequest(BaseModel):
+    phase: Literal["calibrate", "rescue", "retreat"]
+
+
+class TeachLabel(BaseModel):
+    index: int
+    phase: Literal["calibrate", "rescue", "retreat"]
+
+
+class TeachLabelsRequest(BaseModel):
+    labels: list[TeachLabel]
+
+
 class InitPoseRequest(BaseModel):
     execute: bool = False
     confirm_motion: bool = False
+
+
+class RobotStartupRequest(BaseModel):
+    check_only: bool = False
 
 
 class RLTCheckpointRequest(BaseModel):
@@ -598,12 +744,13 @@ class RLTOnlineRequest(RLTCheckpointRequest):
     collection: str = "cobot_magic_rlt"
     raw_fps: int = Field(default=30, ge=1, le=30)
     chunk_hz: float = Field(default=30.0, gt=0, le=30)
-    rollout_speed: float = Field(default=1.0, gt=0, le=1.0)
+    rollout_speed: float = Field(default=0.5, gt=0, le=1.0)
     smooth_profile: Literal["edge_v4", "raw", "smooth_v3", "smooth_v2"] = "edge_v4"
     actor_eef_gate: bool = True
     max_seconds: float = Field(default=3600.0, gt=0, le=14400)
     actor_exploration_std: float = Field(default=0.02, ge=0, le=0.1)
     q_select_k: int = Field(default=0, ge=0, le=64)
+    actor_max_decisions: int = Field(default=0, ge=0, le=3)
     execute: bool = False
     confirm_motion: bool = False
 
@@ -629,11 +776,11 @@ def _within(root: Path, relative: str, *, must_exist: bool = True) -> Path:
     return candidate
 
 
-def _raw_files(config: DashboardConfig) -> list[dict[str, Any]]:
+def _raw_files(config: DashboardConfig, *, paths: list[Path] | None = None) -> list[dict[str, Any]]:
     if not config.raw_root.exists():
         return []
     output = []
-    for path in sorted(config.raw_root.rglob("*.h5"), reverse=True):
+    for path in sorted(config.raw_root.rglob("*.h5") if paths is None else paths, reverse=True):
         relative = path.relative_to(config.raw_root)
         entry: dict[str, Any] = {
             "id": relative.as_posix(),
@@ -696,48 +843,126 @@ def _dataset_files(config: DashboardConfig) -> list[dict[str, Any]]:
     return output
 
 
-def _policy_files(config: DashboardConfig) -> list[dict[str, Any]]:
-    if not config.checkpoint_root.exists():
+def _lerobot_replay_dataset_files(config: DashboardConfig) -> list[dict[str, Any]]:
+    root = config.lerobot_replay_root
+    if not root.exists():
         return []
     output = []
-    for config_path in sorted(config.checkpoint_root.rglob("config.json"), reverse=True):
-        root = config_path.parent
-        model = root / "model.safetensors"
+    for info_path in sorted(root.rglob("meta/info.json")):
+        dataset_root = info_path.parent.parent
+        try:
+            info = json.loads(info_path.read_text())
+            feature = info.get("features", {}).get("action_joint", {})
+            if not isinstance(feature, dict):
+                continue
+            names = feature.get("names", {})
+            if isinstance(names, dict):
+                names = names.get("motors")
+            if not isinstance(names, list) or not names:
+                continue
+            required_right = [*(f"r-j{joint}" for joint in range(1, 7)), "right_gripper"]
+            if not all(name in names for name in required_right):
+                continue
+            output.append(
+                {
+                    "id": dataset_root.relative_to(root).as_posix(),
+                    "frames": int(info.get("total_frames", 0)),
+                    "episodes": int(info.get("total_episodes", 0)),
+                    "fps": int(info.get("fps", 0)),
+                    "robot_type": str(info.get("robot_type", "")),
+                }
+            )
+        except (OSError, ValueError, TypeError):
+            continue
+    return output
+
+
+def _policy_files(config: DashboardConfig) -> list[dict[str, Any]]:
+    output = []
+    if config.checkpoint_root.exists():
+        for config_path in sorted(config.checkpoint_root.rglob("config.json"), reverse=True):
+            root = config_path.parent
+            model = root / "model.safetensors"
+            try:
+                policy_config = json.loads(config_path.read_text())
+            except (OSError, ValueError):
+                policy_config = {}
+            architectures = policy_config.get("architectures", [])
+            is_groot = (
+                (root / "model.safetensors.index.json").is_file()
+                and isinstance(architectures, list)
+                and any(str(name).startswith("Gr00t") for name in architectures)
+            )
+            if not model.exists() and not is_groot:
+                continue
+            relative = root.relative_to(config.checkpoint_root)
+            parts = relative.parts
+            if "checkpoints" in parts:
+                checkpoint_index = parts.index("checkpoints")
+                run_id = Path(*parts[:checkpoint_index]).as_posix()
+                checkpoint_name = (
+                    parts[checkpoint_index + 1]
+                    if checkpoint_index + 1 < len(parts)
+                    else relative.name
+                )
+            else:
+                run_id = (
+                    relative.parent.as_posix()
+                    if relative.parent.as_posix() != "."
+                    else relative.name
+                )
+                checkpoint_name = relative.name
+            output.append(
+                {
+                    "id": relative.as_posix(),
+                    "type": "groot" if is_groot else policy_config.get("type", "unknown"),
+                    "run_id": run_id,
+                    "checkpoint": checkpoint_name,
+                    "step": int(checkpoint_name) if checkpoint_name.isdigit() else None,
+                }
+            )
+
+    external_groot = config.groot_eef_checkpoint_path
+    if external_groot is not None:
+        external_groot = external_groot.expanduser().resolve()
+        config_path = external_groot / "config.json"
         try:
             policy_config = json.loads(config_path.read_text())
         except (OSError, ValueError):
             policy_config = {}
         architectures = policy_config.get("architectures", [])
         is_groot = (
-            (root / "model.safetensors.index.json").is_file()
+            external_groot.is_dir()
+            and (external_groot / "model.safetensors.index.json").is_file()
+            and (external_groot / "processor_config.json").is_file()
             and isinstance(architectures, list)
             and any(str(name).startswith("Gr00t") for name in architectures)
         )
-        if not model.exists() and not is_groot:
-            continue
-        relative = root.relative_to(config.checkpoint_root)
-        parts = relative.parts
-        if "checkpoints" in parts:
-            checkpoint_index = parts.index("checkpoints")
-            run_id = Path(*parts[:checkpoint_index]).as_posix()
-            checkpoint_name = (
-                parts[checkpoint_index + 1]
-                if checkpoint_index + 1 < len(parts)
-                else relative.name
+        if is_groot and not any(
+            Path(item["id"]).as_posix() == GROOT_EEF_POLICY_ID for item in output
+        ):
+            output.append(
+                {
+                    "id": GROOT_EEF_POLICY_ID,
+                    "type": "groot",
+                    "run_id": "external/groot_5482b_eef",
+                    "checkpoint": external_groot.name,
+                    "step": 90000,
+                }
             )
-        else:
-            run_id = relative.parent.as_posix() if relative.parent.as_posix() != "." else relative.name
-            checkpoint_name = relative.name
-        output.append(
-            {
-                "id": relative.as_posix(),
-                "type": "groot" if is_groot else policy_config.get("type", "unknown"),
-                "run_id": run_id,
-                "checkpoint": checkpoint_name,
-                "step": int(checkpoint_name) if checkpoint_name.isdigit() else None,
-            }
-        )
     return output
+
+
+def _resolve_policy_checkpoint(config: DashboardConfig, policy_id: str) -> Path:
+    if policy_id == GROOT_EEF_POLICY_ID:
+        checkpoint = config.groot_eef_checkpoint_path
+        if checkpoint is None:
+            raise FileNotFoundError("external GR00T EEF checkpoint is not configured")
+        resolved = checkpoint.expanduser().resolve()
+        if not resolved.is_dir():
+            raise FileNotFoundError(resolved)
+        return resolved
+    return _within(config.checkpoint_root, policy_id)
 
 
 def _read_rlt_pipeline_status(path: Path) -> dict[str, Any]:
@@ -918,7 +1143,11 @@ def _rlt_actor_files(config: DashboardConfig, checkpoint_path: Path) -> list[dic
                             if output_semantics.startswith("direct")
                             else "Residual RL Actor · "
                         )
-                        + status_path.parent.name.removeprefix("cobot_magic_073rel_rlt_stage2_")
+                        + (
+                            status_path.parent.name.split("_stage2_", 1)[1]
+                            if "_stage2_" in status_path.parent.name
+                            else status_path.parent.name.removeprefix("cobot_magic_073rel_rlt_stage2_")
+                        )
                     )
                 ),
                 "total_updates": updates,
@@ -1158,12 +1387,40 @@ def _policy_endpoint(config: DashboardConfig, compute: str) -> str:
 def _policy_id_from_path(
     config: DashboardConfig, compute: str, policy_path: str | None
 ) -> str | None:
+    if compute == "pc" and policy_path and config.groot_eef_checkpoint_path is not None:
+        try:
+            if (
+                Path(policy_path).expanduser().resolve()
+                == config.groot_eef_checkpoint_path.expanduser().resolve()
+            ):
+                return GROOT_EEF_POLICY_ID
+        except OSError:
+            pass
     root = (
         config.robot_workspace / "checkpoints"
         if compute == "robot"
         else config.checkpoint_root
     )
     return _relative_id(root, policy_path)
+
+
+def _tcp_endpoint_in_use(endpoint: str) -> bool:
+    """True when something already accepts TCP connections on a ``tcp://host:port``.
+
+    A just-stopped server can keep its ZMQ socket for a moment, and a server
+    started outside the dashboard holds it while the job manager knows nothing.
+    Either way the replacement server fails to bind and exits, which used to look
+    like a job that started and immediately completed.
+    """
+
+    match = re.fullmatch(r"tcp://([^:/]+):(\d+)", endpoint.strip())
+    if match is None:
+        return False
+    try:
+        with socket.create_connection((match.group(1), int(match.group(2))), timeout=0.25):
+            return True
+    except OSError:
+        return False
 
 
 def _policy_server_status(config: DashboardConfig, manager: JobManager) -> dict[str, Any]:
@@ -1225,11 +1482,58 @@ DEFAULT_RLT_ACTOR_WEIGHTS = {
     # file still supplies ``action_stats`` (not stored in checkpoint payloads)
     # and the fallbacks for older checkpoints without the new fields.
     "actor_output_semantics": "residual",
-    "ref_anchor_weight": 0.0,
+    "ref_anchor_weight": 0.5,
     "ref_anchor_mask": "none",
     "action_stats": None,
 }
 RLT_ACTOR_WEIGHTS_FILENAME = "rlt_actor_weights.json"
+
+
+def _actor_takeover_decisions_for_frame(
+    actor_start_step: int | None,
+    reference_action_steps: int | None,
+    rollout_speed: float,
+) -> int:
+    """Convert a 30 Hz Actor frame gate into complete reference chunks."""
+
+    if (
+        actor_start_step is None
+        or actor_start_step <= 0
+        or reference_action_steps is None
+        or reference_action_steps <= 0
+        or not math.isfinite(rollout_speed)
+        or rollout_speed <= 0
+    ):
+        return 0
+    executed_reference_steps = max(
+        2, int(round(reference_action_steps / rollout_speed))
+    )
+    return int(math.ceil(actor_start_step / executed_reference_steps))
+
+
+RLT_ACTOR_TAKEOVER_DECISION_OVERRIDES = {
+    # The v7 Actor was trained with a 720-frame handover annotation, but its
+    # deployment rollout should hand control over earlier reference decisions
+    # for rollout timing experiments.
+    "cobot_magic_smolvla_il2trimrel80k_rlt_stage1_rlinf960_ref30_actor30_5k_bs64_stage2_actor20_speed05_seq_m26q1_ilfakebc_v1v4q1_utd5_g720_loose_v1_frozen83_v7": 9,
+}
+
+
+def _actor_takeover_decisions_for_checkpoint(
+    checkpoint: Path | None,
+    actor_start_step: int | None,
+    reference_action_steps: int | None,
+    rollout_speed: float,
+) -> int:
+    """Apply a deployment-only handover override for a selected Actor."""
+
+    if checkpoint is not None:
+        override = RLT_ACTOR_TAKEOVER_DECISION_OVERRIDES.get(checkpoint.parent.name)
+        if override is not None:
+            return int(override)
+    return _actor_takeover_decisions_for_frame(
+        actor_start_step, reference_action_steps, rollout_speed
+    )
 
 
 def _load_rlt_actor_weights(config: DashboardConfig) -> dict[str, Any]:
@@ -1446,6 +1750,84 @@ def create_app(
         if config.api_token and x_cobot_token != config.api_token:
             raise HTTPException(status_code=401, detail="invalid dashboard token")
 
+    runtime_events = DashboardEvents(
+        manager.list,
+        lambda: _policy_server_status(config, manager),
+        lambda: _rlt_policy_server_status(config, manager),
+        lambda output: _raw_files(config, paths=[Path(output)])[0],
+        robot_status=getattr(device_monitor, 'control_status', None),
+    )
+    app.router.on_startup.append(runtime_events.start)
+    app.router.on_shutdown.append(runtime_events.stop)
+    app.state.runtime_events = runtime_events
+
+    @app.get("/api/events")
+    async def runtime_event_stream(
+        request: Request,
+        x_cobot_token: str | None = Header(default=None),
+        last_event_id: str | None = Header(default=None),
+    ) -> StreamingResponse:
+        authorize(x_cobot_token)
+        try:
+            cursor = max(0, int(last_event_id)) if last_event_id else None
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="invalid Last-Event-ID") from exc
+
+        def encode(event: dict[str, Any]) -> str:
+            return ((f"id: {event['id']}\n" if 'id' in event else '') + f"event: {event['event']}\n"
+                    f"data: {json.dumps(event['data'], ensure_ascii=False)}\n\n")
+
+        async def stream():
+            nonlocal cursor
+            heartbeat = time.monotonic()
+            robot_revision = None
+            robot_heartbeat = 0.0
+            joint_revision = None
+            joint_sent_at = 0.0
+            if cursor is None:
+                initial = runtime_events.snapshot()
+                cursor = initial["id"]
+                yield encode(initial)
+            while not await request.is_disconnected():
+                # Latest-only priority lane, sent before task/model history.
+                # No SSE id: reconnects must not replay stale control transitions.
+                robot_event = runtime_events.robot_event_after(robot_revision)
+                if robot_event and (robot_event['event'] == 'robot_status_changed'
+                                    or time.monotonic() - robot_heartbeat >= 1):
+                    robot_revision = robot_event['data']['revision']
+                    robot_heartbeat = time.monotonic()
+                    yield encode(robot_event)
+                if time.monotonic() - joint_sent_at >= 0.5:
+                    joint_reader = getattr(device_monitor, 'joint_state', None)
+                    joints = joint_reader() if joint_reader else None
+                    if joints and joints['revision'] != joint_revision:
+                        joint_revision = joints['revision']
+                        joint_sent_at = time.monotonic()
+                        yield encode({'event': 'joint_state', 'data': joints})
+                events = runtime_events.after(cursor)
+                if events is None:
+                    event = runtime_events.snapshot()
+                    cursor = event["id"]
+                    yield encode(event)
+                else:
+                    for event in events:
+                        cursor = event["id"]
+                        yield encode(event)
+                if time.monotonic() - heartbeat >= 15:
+                    yield ": keep-alive\n\n"
+                    heartbeat = time.monotonic()
+                await asyncio.sleep(0.1)
+
+        return StreamingResponse(stream(), media_type="text/event-stream", headers={
+            "Cache-Control": "no-store", "X-Accel-Buffering": "no",
+        })
+
+    @app.get('/api/robot/joints')
+    def robot_joint_cache(x_cobot_token: str | None = Header(default=None)) -> dict[str, Any]:
+        authorize(x_cobot_token)
+        reader = getattr(device_monitor, 'joint_state', None)
+        return reader() if reader else {'revision': 0, 'age_ms': None, 'arms': {}}
+
     if config.debug_capture_enabled:
         app.router.on_startup.append(debug_capture.start)
     app.router.on_shutdown.append(preview_relay.stop)
@@ -1591,6 +1973,7 @@ def create_app(
             bridge,
             raws,
             datasets,
+            lerobot_replay_datasets,
             policies,
             policy_server,
             rlt_policy_server,
@@ -1598,6 +1981,7 @@ def create_app(
             probe,
             asyncio.to_thread(_raw_files, config),
             asyncio.to_thread(_dataset_files, config),
+            asyncio.to_thread(_lerobot_replay_dataset_files, config),
             asyncio.to_thread(_policy_files, config),
             asyncio.to_thread(_policy_server_status, config, manager),
             asyncio.to_thread(_rlt_policy_server_status, config, manager),
@@ -1618,6 +2002,7 @@ def create_app(
             "bridge": bridge,
             "raws": raws,
             "datasets": datasets,
+            "lerobot_replay_datasets": lerobot_replay_datasets,
             "policies": policies,
             "policy_server": policy_server,
             "debug_capture": debug_capture.snapshot(),
@@ -1637,6 +2022,7 @@ def create_app(
             "paths": {
                 "raw_root": str(config.raw_root),
                 "dataset_root": str(config.dataset_root),
+                "lerobot_replay_root": str(config.lerobot_replay_root),
                 "checkpoint_root": str(config.checkpoint_root),
                 "rlt_root": str(config.rlt_root),
                 "policy_server_endpoint": config.policy_server_endpoint,
@@ -1662,7 +2048,7 @@ def create_app(
                     detail="stop the RLT rollout server before loading a normal PC model server",
                 )
         try:
-            policy_path = _within(config.checkpoint_root, request.policy_id)
+            policy_path = _resolve_policy_checkpoint(config, request.policy_id)
         except (ValueError, FileNotFoundError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         status = _policy_server_status(config, manager)
@@ -1671,11 +2057,12 @@ def create_app(
                 status.get("policy_id") == request.policy_id
                 and status.get("compute") == request.compute
                 and status.get("inference_chunking", "original") == request.inference_chunking
+                and (request.num_steps is None or status.get("num_steps") == request.num_steps)
             ):
                 return {**status, "already_running": True}
             raise HTTPException(
                 status_code=409,
-                detail="another model is already loaded; stop the model server first",
+                detail="another model or denoising-step setting is already loaded; stop the model server first",
             )
         try:
             selected_config = json.loads((policy_path / "config.json").read_text())
@@ -1686,6 +2073,11 @@ def create_app(
             str(name).startswith("Gr00t") for name in architectures
         )
         is_smolvla = selected_config.get("type") == "smolvla"
+        if request.num_steps is not None and not is_smolvla:
+            raise HTTPException(
+                status_code=400,
+                detail="Denoising-step override is supported only for SmolVLA checkpoints",
+            )
         if is_groot and request.compute == "robot":
             raise HTTPException(
                 status_code=400,
@@ -1727,6 +2119,8 @@ def create_app(
                 "front",
                 "right",
             ]
+            if request.num_steps is not None:
+                command.extend(("--num-steps", str(request.num_steps)))
         elif is_groot:
             command = [
                 str(config.groot_python),
@@ -1742,6 +2136,8 @@ def create_app(
                 "front",
                 "right",
             ]
+            if config.groot_backbone_path is not None:
+                command.extend(("--backbone-path", str(config.groot_backbone_path)))
         else:
             command = [
                 str(config.python),
@@ -1766,6 +2162,21 @@ def create_app(
                         "1",
                     )
                 )
+            if request.num_steps is not None:
+                command.extend(("--num-steps", str(request.num_steps)))
+            residual_dirs: dict[str, str] = {}
+            for flag, raw in (("--residual-actor", request.residual_actor), ("--z-encoder", request.z_encoder)):
+                if not raw:
+                    continue
+                path = Path(raw)
+                if not path.is_absolute():
+                    path = (config.workspace / path).resolve()
+                if not path.is_dir():
+                    raise HTTPException(status_code=400, detail=f"{flag} directory not found: {path}")
+                command.extend((flag, str(path)))
+                residual_dirs[flag.lstrip("-")] = str(path)
+            if bool(request.residual_actor) != bool(request.z_encoder):
+                raise HTTPException(status_code=400, detail="residual_actor and z_encoder must be provided together")
         return start_job(
             "policy_server",
             command,
@@ -1774,6 +2185,9 @@ def create_app(
                 "compute": request.compute,
                 "endpoint": _policy_endpoint(config, request.compute),
                 "inference_chunking": request.inference_chunking,
+                "num_steps": request.num_steps,
+                "residual_actor": request.residual_actor if request.compute == "pc" else None,
+                "z_encoder": request.z_encoder if request.compute == "pc" else None,
             },
         )
 
@@ -2164,6 +2578,16 @@ def create_app(
                 status_code=409,
                 detail="another Stage 1 or Actor is loaded; stop the RLT server first",
             )
+        if not status.get("job_id") and _tcp_endpoint_in_use(config.rlt_policy_server_endpoint):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"{config.rlt_policy_server_endpoint} is still held by a process this "
+                    "dashboard does not track, so a new server could not bind it. "
+                    "Wait a few seconds and retry, or find the holder with "
+                    f"ss -ltnp 'sport = :{config.rlt_policy_server_endpoint.rsplit(':', 1)[-1]}'."
+                ),
+            )
         command = [
             str(config.python),
             "-m",
@@ -2499,10 +2923,13 @@ def create_app(
                     "direct" if _sem.startswith("direct") else "residual"
                 )
             _aw = actor_payload.get("ref_anchor_weight")
-            actor_weights["ref_anchor_weight"] = float(_aw) if _aw is not None else 0.0
-            _am = actor_payload.get("ref_anchor_mask")
-            actor_weights["ref_anchor_mask"] = str(_am) if _am else "none"
-            _stats = actor_payload.get("action_stats_path") or actor_weights.get("action_stats")
+            actor_weights["ref_anchor_weight"] = max(
+                0.5, float(_aw) if _aw is not None else 0.5
+            )
+            actor_weights["ref_anchor_mask"] = "none"
+            _stats = actor_payload.get("action_stats_path") or actor_weights.get(
+                "action_stats"
+            )
             actor_weights["action_stats"] = str(_stats) if _stats else None
             if (
                 actor_weights["ref_anchor_mask"] != "none"
@@ -2515,6 +2942,25 @@ def create_app(
                         f"stats path is available; set action_stats in {RLT_ACTOR_WEIGHTS_FILENAME}"
                     ),
                 )
+        actor_start_step = None
+        if isinstance(actor_payload, dict):
+            recorded_start = actor_payload.get("actor_start_step")
+            if isinstance(recorded_start, (int, float)):
+                actor_start_step = int(recorded_start)
+        takeover_decisions = (
+            _actor_takeover_decisions_for_checkpoint(
+                server_actor_path,
+                actor_start_step,
+                int(rlt_server.get("reference_action_steps", 0) or 0),
+                float(request.rollout_speed),
+            )
+            if actor_enabled
+            else 0
+        )
+        # Actor rollouts must pass through the PC-side velocity/acceleration
+        # shaper. A raw actor chunk can reproduce the takeover speed jump even
+        # when the selected UI profile is intended for a reference trial.
+        rollout_profile = "edge_v4" if actor_enabled else request.smooth_profile
         command = [
             str(config.python),
             "-m",
@@ -2551,7 +2997,7 @@ def create_app(
             "--rollout-speed",
             str(request.rollout_speed),
             "--smooth-profile",
-            request.smooth_profile,
+            rollout_profile,
             "--max-seconds",
             str(request.max_seconds),
             "--actor-exploration-std",
@@ -2562,16 +3008,17 @@ def create_app(
             ),
             "--q-select",
             str(int(request.q_select_k) if not actor_read_only else 0),
+            "--actor-max-decisions",
+            str(request.actor_max_decisions if actor_enabled else 0),
             "--send-actions",
             "--confirm-motion",
         ]
         command.append(
             "--actor-eef-gate" if request.actor_eef_gate else "--no-actor-eef-gate"
         )
-        # Make the dashboard checkbox's semantics explicit: checked selects
-        # the calibrated grasped-fixture phase gate, not the historical fixed
-        # 13-decision handover.
-        command.extend(("--actor-takeover-decisions", "0"))
+        # Current rollout calibration: expose Actor after six complete
+        # reference decisions.
+        command.extend(("--actor-takeover-decisions", "6"))
         if actor_enabled and not inference_only:
             command.extend(
                 [
@@ -2638,7 +3085,12 @@ def create_app(
                 "actor_enabled": actor_enabled,
                 "actor_read_only": actor_read_only,
                 "actor_eef_gate": bool(request.actor_eef_gate),
-                "smooth_profile": request.smooth_profile,
+                "actor_start_step": actor_start_step,
+                "actor_takeover_decisions": takeover_decisions,
+                "actor_max_decisions": (
+                    request.actor_max_decisions if actor_enabled else 0
+                ),
+                "smooth_profile": rollout_profile,
                 "rollout_speed": float(request.rollout_speed),
                 "training_requested": bool(actor_enabled and not inference_only),
                 "inference_only": inference_only,
@@ -2704,6 +3156,128 @@ def create_app(
     ) -> dict[str, Any]:
         authorize(x_cobot_token)
         return _rlt_result(job_id, "discard")
+
+    @app.post("/api/jobs/{job_id}/intervention-phase")
+    def intervention_phase(
+        job_id: str,
+        request: InterventionPhaseRequest,
+        x_cobot_token: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        """Append an intervention-phase mark beside the episode's result file.
+
+        The dashboard records one JSON line per phase switch into
+        ``<raw-stem>.phases.jsonl`` next to the episode ``.result`` file.
+        Offline reconstruction/provenance attributes each human transition to
+        the latest mark at or before its own ``time_ns``; unmarked (legacy)
+        rows keep the "unknown" phase instead of a fabricated default.
+        """
+        authorize(x_cobot_token)
+        job = next((item for item in manager.list() if item["id"] == job_id), None)
+        if job is None or job.get("kind") != "rlt_online_execute":
+            raise HTTPException(status_code=404, detail="active Online RLT episode not found")
+        if job.get("state") != "running":
+            raise HTTPException(status_code=409, detail="Online RLT episode is not running")
+        result_value = (job.get("metadata") or {}).get("result_file")
+        if not result_value:
+            raise HTTPException(status_code=500, detail="Online RLT result file is missing")
+        result_path = Path(result_value)
+        stem = result_path.name
+        if stem.endswith(".result"):
+            stem = stem[: -len(".result")]
+        sidecar = result_path.parent / f"{stem}.phases.jsonl"
+        record = {"t_ns": time.time_ns(), "phase": request.phase}
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        with sidecar.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record) + "\n")
+        return {"ok": True, "path": str(sidecar), **record}
+
+    def _rlt_sidecar_and_segments(job: dict[str, Any]) -> tuple[Path, list[dict[str, Any]]]:
+        metadata = job.get("metadata") or {}
+        raw_value = metadata.get("raw_output")
+        decision_value = metadata.get("decision_output")
+        if not raw_value:
+            raise HTTPException(status_code=500, detail="Online RLT raw output path is missing")
+        sidecar = Path(f"{raw_value}.phases.jsonl")
+        if not decision_value or not Path(decision_value).is_file():
+            raise HTTPException(status_code=409, detail="decision stream not available yet")
+        import h5py
+
+        with h5py.File(decision_value, "r") as stream:
+            human = stream["is_intervention"][:].astype(bool)
+            times = stream["time_ns"][:].astype("int64")
+        segments: list[dict[str, Any]] = []
+        index, total = 0, len(human)
+        while index < total:
+            if not human[index]:
+                index += 1
+                continue
+            end = index
+            while end < total and human[end]:
+                end += 1
+            t0 = int(times[index])
+            t1 = int(times[end]) if end < total else int(times[-1])
+            segments.append({
+                "index": len(segments),
+                "t0_ns": t0,
+                "t1_ns": t1,
+                "start_s": round((t0 - int(times[0])) / 1e9, 1) if total else 0.0,
+                "dur_s": round((t1 - t0) / 1e9, 1),
+            })
+            index = end
+        return sidecar, segments
+
+    @app.get("/api/jobs/{job_id}/teach-segments")
+    def teach_segments(
+        job_id: str,
+        x_cobot_token: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        """Detected Teach intervention segments for post-episode phase labels."""
+        authorize(x_cobot_token)
+        job = next((item for item in manager.list() if item["id"] == job_id), None)
+        if job is None or job.get("kind") != "rlt_online_execute":
+            raise HTTPException(status_code=404, detail="Online RLT episode not found")
+        _, segments = _rlt_sidecar_and_segments(job)
+        return {"job_id": job_id, "state": job.get("state"), "segments": segments}
+
+    @app.post("/api/jobs/{job_id}/teach-labels")
+    def teach_labels(
+        job_id: str,
+        request: TeachLabelsRequest,
+        x_cobot_token: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        """Store interval phase labels for teach segments (replaces prior set).
+
+        Labels are interval records appended to the episode's phases sidecar;
+        point marks written live are preserved.  Attribution happens when
+        replay is loaded, so labelling may occur any time before training.
+        """
+        authorize(x_cobot_token)
+        job = next((item for item in manager.list() if item["id"] == job_id), None)
+        if job is None or job.get("kind") != "rlt_online_execute":
+            raise HTTPException(status_code=404, detail="Online RLT episode not found")
+        sidecar, segments = _rlt_sidecar_and_segments(job)
+        by_index = {segment["index"]: segment for segment in segments}
+        intervals = []
+        for label in request.labels:
+            segment = by_index.get(label.index)
+            if segment is None:
+                raise HTTPException(status_code=409, detail=f"teach segment {label.index} no longer exists")
+            intervals.append({"t0_ns": segment["t0_ns"], "t1_ns": segment["t1_ns"], "phase": label.phase, "src": "teach_labels"})
+        preserved: list[str] = []
+        if sidecar.is_file():
+            for line in sidecar.read_text(encoding="utf-8").splitlines():
+                try:
+                    item = json.loads(line)
+                except ValueError:
+                    continue
+                if "t0_ns" in item and "t1_ns" in item:
+                    continue  # replaced wholesale by the new label set
+                preserved.append(json.dumps(item))
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        temporary = sidecar.with_name(sidecar.name + f".{uuid.uuid4().hex}.tmp")
+        temporary.write_text("".join(line + "\n" for line in [*preserved, *(json.dumps(record) for record in intervals)]))
+        os.replace(temporary, sidecar)
+        return {"ok": True, "labeled": len(intervals), "segments": len(segments), "path": str(sidecar)}
 
     @app.post("/api/jobs/record")
     def record(
@@ -2940,6 +3514,75 @@ def create_app(
             )
         return start_job("replay_dry_run", command)
 
+    @app.post("/api/jobs/replay-lerobot")
+    def replay_lerobot(
+        request: LerobotReplayRequest, x_cobot_token: str | None = Header(default=None)
+    ) -> dict[str, Any]:
+        authorize(x_cobot_token)
+        if request.execute and not request.confirm_motion:
+            raise HTTPException(status_code=400, detail="real motion requires confirm_motion=true")
+        try:
+            dataset_path = _within(config.lerobot_replay_root, request.dataset_id)
+            exported = config.run_root / "lerobot_replay" / f"{uuid.uuid4().hex}.raw.h5"
+            replay = export_episode_to_raw(
+                dataset_path,
+                request.episode_index,
+                exported,
+                side=request.side,
+            )
+        except (ValueError, FileNotFoundError, OSError, RuntimeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        command = [
+            str(config.python),
+            "-m",
+            "cobot_bridge.replay_raw",
+            "--raw",
+            replay["path"],
+            "--endpoint",
+            config.endpoint,
+            "--side",
+            request.side,
+            "--source",
+            "puppet_command",
+            "--mode",
+            "puppet",
+            "--waypoint-hz",
+            str(request.waypoint_hz),
+            "--speed-scale",
+            str(request.speed_scale),
+            "--alignment-speed",
+            str(request.alignment_speed),
+            "--alignment-min-seconds",
+            str(request.alignment_min_seconds),
+            "--no-trim-stationary-holds",
+        ]
+        metadata = {
+            "source_type": "lerobot",
+            "dataset_id": request.dataset_id,
+            "episode_index": request.episode_index,
+            "source_feature": replay["source_feature"],
+            "joint_dimensions": replay["joint_dimensions"],
+            "frames": replay["frames"],
+            "fps": replay["fps"],
+            "speed_scale": request.speed_scale,
+            "alignment_speed": request.alignment_speed,
+            "exported_replay_h5": replay["path"],
+            "mode": "puppet",
+        }
+        if not request.execute:
+            return start_job("replay_dry_run", command, metadata)
+        command.append("--execute")
+        return start_motion_job(
+            "replay_execute",
+            command,
+            metadata,
+            task=replay["task"],
+            side=request.side,
+            cameras=("front", request.side),
+            policy_id=f"lerobot:{Path(request.dataset_id).name}:ep{request.episode_index}",
+        )
+
     @app.post("/api/jobs/policy")
     def policy(
         request: PolicyRequest, x_cobot_token: str | None = Header(default=None)
@@ -3110,10 +3753,10 @@ def create_app(
         if request.n_action_steps is not None:
             command.extend(("--n-action-steps", str(request.n_action_steps)))
         if request.execute:
-            # Rollout starts from the bridge's current measured state.  Init
-            # pose remains an explicit, separate UI operation; it must not be
-            # an implicit prerequisite for any rollout.
-            command.append("--send-actions")
+            # Preserve the rollout contract used by the trained policies:
+            # verify and hold the Ready pose after taking control, then reset
+            # local rollout state before the first policy chunk is consumed.
+            command.extend(("--startup-init-hold", "--send-actions"))
         metadata = {
             "policy_id": server.get("policy_id"),
             "compute": compute,
@@ -3183,6 +3826,31 @@ def create_app(
         except Exception as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         return {"safe": True, **result}
+
+    @app.post("/api/system/start-robot")
+    async def start_robot(
+        request: RobotStartupRequest,
+        x_cobot_token: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        authorize(x_cobot_token)
+        if any(j["state"] in ("running", "stopping") and (
+            j["kind"] in RECORD_JOB_KINDS | MOTION_JOB_KINDS | STARTUP_JOB_KINDS
+        ) for j in manager.list()):
+            raise HTTPException(status_code=409, detail="请先结束录制、运动或其他设备维护任务")
+        probe = await asyncio.to_thread(device_monitor.probe)
+        if not request.check_only and (probe.get("teach_active") or probe.get("output_enabled")):
+            raise HTTPException(status_code=409, detail="请先关闭 Teach 和运动输出")
+        report = config.run_root / f"robot_startup_{uuid.uuid4().hex[:12]}.json"
+        command = [str(config.python), "-m", "cobot_bridge.ensure_robot",
+                   "--ssh-host", config.robot_ssh_host,
+                   "--remote-workspace", str(config.robot_control_workspace),
+                   "--endpoint", config.endpoint, "--report", str(report)]
+        if request.check_only:
+            command.append("--check-only")
+        if config.robot_sudo_password_file is not None:
+            command.extend(["--sudo-password-file", str(config.robot_sudo_password_file)])
+        return start_job("robot_self_check" if request.check_only else "robot_startup", command,
+                         {"startup_report_file": str(report), "check_only": request.check_only})
 
     @app.post("/api/system/restart-devices")
     async def restart_devices(

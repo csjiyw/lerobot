@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 import logging
 import time
 from contextlib import nullcontext
@@ -22,6 +23,7 @@ from .policy_client import (
 )
 from .protocol import CAMERAS
 from .run_lerobot_policy import _load_policy
+from .z_actor import load_actor, load_z_encoder
 
 
 LOG = logging.getLogger("cobot_bridge.policy_server")
@@ -46,8 +48,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Guided RTC overlap/execution horizon in policy-rate actions",
     )
     parser.add_argument(
+        "--num-steps",
+        type=int,
+        choices=(5, 10, 20),
+        default=None,
+        help="SmolVLA flow-matching denoising steps (default: checkpoint config)",
+    )
+    parser.add_argument(
         "--vlm-model-path",
         help="local SmolVLM config/processor directory; skip loading duplicate base weights",
+    )
+    parser.add_argument(
+        "--residual-actor",
+        help="directory with actor.pt + config.json; compose ref + bounded correction",
+    )
+    parser.add_argument(
+        "--z-encoder",
+        help="directory with z_encoder.pt + config.json",
     )
     return parser
 
@@ -175,10 +192,69 @@ def _normalize_rtc_leftover(
     return normalized.unsqueeze(0)
 
 
+def _apply_residual_correction(
+    observation: dict[str, np.ndarray],
+    *,
+    policy,
+    preprocessor,
+    task: str,
+    robot_type: str,
+    absolute_chunk: np.ndarray,
+    z_enc,
+    actor,
+    cap: np.ndarray,
+    device: torch.device,
+    stats: dict | None = None,
+) -> np.ndarray:
+    """Compose ref + cap*tanh(actor(z, state, ref)) for a relative-EEF policy."""
+    from lerobot.policies.smolvla.relative_eef import relative_chunk_to_absolute
+    from lerobot.policies.utils import prepare_observation_for_inference
+    from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
+
+    # ``prepare_observation_for_inference`` mutates its dict in place; work on a
+    # copy so the caller's observation stays untouched (and accept tensors if a
+    # previous prediction already converted it).
+    obs_np: dict[str, Any] = {}
+    for key, value in observation.items():
+        if isinstance(value, torch.Tensor):
+            obs_np[key] = value.detach().float().cpu().numpy()
+        elif isinstance(value, np.ndarray):
+            obs_np[key] = value.copy()
+        else:
+            obs_np[key] = value
+    batch = prepare_observation_for_inference(obs_np, device, task, robot_type)
+    batch = preprocessor(batch)
+    images, img_masks = policy.prepare_images(batch)
+    state_norm = policy.prepare_state(batch)
+    with torch.no_grad():
+        prefix, pmask = policy.model.extract_rlt_prefix(
+            images, img_masks, batch[OBS_LANGUAGE_TOKENS], batch[OBS_LANGUAGE_ATTENTION_MASK], state_norm
+        )
+        z = z_enc(prefix, pmask)
+        raw_state = np.asarray(observation["observation.state"], dtype=np.float32).reshape(7)
+        x = np.concatenate([z[0].float().cpu().numpy(), raw_state, absolute_chunk.reshape(-1)])
+        if stats and stats.get("mu") is not None:
+            x = (x - stats["mu"]) / stats["sd"]
+        corr = cap * np.tanh(actor(torch.as_tensor(x, dtype=torch.float32, device=device).unsqueeze(0)).reshape(30, 7).cpu().numpy())
+    return (absolute_chunk + corr).astype(np.float32)
+
+
 def main() -> None:
     args = build_parser().parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     policy, preprocessor, postprocessor = _load_policy(args)
+    residual_actor = residual_cap = z_enc = None
+    residual_stats: dict = {}
+    if args.residual_actor or args.z_encoder:
+        if not (args.residual_actor and args.z_encoder):
+            raise SystemExit("--residual-actor and --z-encoder must be provided together")
+        residual_actor, residual_cap, residual_stats = load_actor(
+            str(Path(args.residual_actor) / "actor.pt"), str(Path(args.residual_actor) / "config.json")
+        )
+        z_enc = load_z_encoder(
+            str(Path(args.z_encoder) / "z_encoder.pt"), str(Path(args.z_encoder) / "config.json")
+        )
+        residual_actor.to(policy.config.device); z_enc.to(policy.config.device)
     if args.inference_chunking == "guided_rtc":
         _configure_guided_rtc(policy, execution_horizon=args.rtc_execution_horizon)
     from lerobot.utils.control_utils import predict_action
@@ -190,12 +266,13 @@ def main() -> None:
     socket.setsockopt(zmq.LINGER, 0)
     socket.bind(args.bind)
     LOG.info(
-        "policy server ready bind=%s device=%s cameras=%s policy=%s chunking=%s",
+        "policy server ready bind=%s device=%s cameras=%s policy=%s chunking=%s denoising_steps=%s",
         args.bind,
         device,
         configured_cameras,
         args.policy_path,
         args.inference_chunking,
+        getattr(policy.config, "num_steps", None),
     )
     shutdown_requested = False
     # Owned entirely by the resident server.  It is intentionally saved after
@@ -220,6 +297,8 @@ def main() -> None:
                         "policy_path": str(args.policy_path),
                         "chunk_size": int(policy.config.chunk_size),
                         "n_action_steps": int(policy.config.n_action_steps),
+                        "policy_type": str(getattr(policy.config, "type", "unknown")),
+                        "num_steps": getattr(policy.config, "num_steps", None),
                         "inference_chunking": args.inference_chunking,
                         "relative_eef_actions": _processor_uses_relative_eef_actions(preprocessor),
                         "rtc": (
@@ -257,6 +336,8 @@ def main() -> None:
                     observation: dict[str, np.ndarray] = {"observation.state": state}
                     for name, data in zip(cameras, frames[1:], strict=True):
                         observation[_policy_key(name)] = _decode_jpeg(data)
+                    # keep a pristine copy: inference mutates the dict in place
+                    observation_raw = {key: value.copy() for key, value in observation.items()}
                     started = time.perf_counter()
                     if command == "PREDICT_CHUNK":
                         if "rtc_leftover_targets" in request or "rtc_inference_delay" in request:
@@ -306,6 +387,20 @@ def main() -> None:
                         values = _restore_relative_eef_chunk(
                             preprocessor, state, native_values
                         )
+                        if residual_actor is not None:
+                            values = _apply_residual_correction(
+                                observation_raw,
+                                policy=policy,
+                                preprocessor=preprocessor,
+                                task=str(request.get("task", "")),
+                                robot_type=str(request.get("robot_type", "cobot_magic_piper")),
+                                absolute_chunk=values,
+                                z_enc=z_enc,
+                                actor=residual_actor,
+                                cap=residual_cap,
+                                device=device,
+                                stats=residual_stats,
+                            )
                         if values.ndim != 2 or values.shape[1:] != (7,) or not np.isfinite(values).all():
                             raise PolicyServerError(f"policy returned invalid action chunk: {values.shape}")
                         if args.inference_chunking == "guided_rtc":

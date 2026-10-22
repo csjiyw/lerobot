@@ -1,7 +1,16 @@
 const state = {
   overview: null,
   selectedJob: null,
-  polling: null,
+  refreshPromise: null,
+  eventVersion: 0,
+  eventCursor: null,
+  eventController: null,
+  eventsStopped: false,
+  robotStatus: null,
+  robotWatchdog: null,
+  jointState: null,
+  jointWatchdog: null,
+  runtimePatch: { jobs: null, policy_server: null, rlt_policy_server: null, raws: new Map() },
   activeIlRecord: null,
   activeRlRecord: null,
   activeReplay: null,
@@ -23,6 +32,9 @@ const LIVE_CAMERA_NAMES = ["front", "left", "right"];
 const PREVIEW_ROUTE_STORAGE_KEY = "cobot_preview_route";
 const POLICY_RUN_STORAGE_KEY = "cobot_policy_run";
 const POLICY_CHECKPOINT_STORAGE_KEY = "cobot_policy_checkpoint";
+const POLICY_DENOISING_STEPS_STORAGE_KEY = "cobot_policy_denoising_steps";
+const REPLAY_DATASET_STORAGE_KEY = "cobot_replay_lerobot_dataset";
+const REPLAY_EPISODE_STORAGE_KEY = "cobot_replay_lerobot_episode";
 const previewQuery = new URLSearchParams(window.location.search);
 const agxPreviewRequested = previewQuery.get("preview") === "agx-local" || previewQuery.has("agx_mjpeg");
 if (agxPreviewRequested) localStorage.setItem(PREVIEW_ROUTE_STORAGE_KEY, "agx-local");
@@ -80,6 +92,54 @@ function fillSelect(id, items, kind) {
     option.textContent = `No ${kind} available`;
     select.appendChild(option);
   }
+}
+
+function fillLerobotReplayDatasets(datasets) {
+  const select = $("replayDataset");
+  const previous = select.value || localStorage.getItem(REPLAY_DATASET_STORAGE_KEY) || "";
+  const preferred = "cobotmagic/5482b62ee3ff498a92f139f0788c0544_head_eef_joint";
+  select.innerHTML = "";
+  for (const item of datasets) {
+    const option = document.createElement("option");
+    option.value = item.id;
+    option.textContent = `${item.id} · ${item.episodes} ep · ${item.fps} FPS`;
+    select.appendChild(option);
+  }
+  if (!datasets.length) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "No LeRobot replay dataset found";
+    select.appendChild(option);
+  } else if (datasets.some((item) => item.id === previous)) {
+    select.value = previous;
+  } else if (datasets.some((item) => item.id === preferred)) {
+    select.value = preferred;
+  } else {
+    select.value = datasets[0].id;
+  }
+
+  const selected = datasets.find((item) => item.id === select.value);
+  const episode = $("replayEpisode");
+  const maximum = Math.max(0, Number(selected?.episodes || 1) - 1);
+  episode.max = String(maximum);
+  const savedEpisode = localStorage.getItem(REPLAY_EPISODE_STORAGE_KEY);
+  if (episode.value === "" && savedEpisode !== null) episode.value = savedEpisode;
+  const index = Number(episode.value);
+  if (document.activeElement !== episode && (!Number.isInteger(index) || index < 0 || index > maximum)) {
+    episode.value = "0";
+  }
+  localStorage.setItem(REPLAY_DATASET_STORAGE_KEY, select.value);
+  localStorage.setItem(REPLAY_EPISODE_STORAGE_KEY, episode.value || "0");
+  $("lerobotReplayHint").textContent = selected
+    ? `右臂 action_joint（6 个关节 + 夹爪），单臂 Puppet 模式。${selected.episodes} 个 episode；先慢速对齐到所选 episode 第 0 帧，再开始回放。`
+    : `没有找到可回放的 LeRobot 数据集。检查 replay 根目录：${state.overview?.paths?.lerobot_replay_root || "—"}`;
+}
+
+function renderReplaySourceControls() {
+  const lerobot = $("replaySource").value === "lerobot";
+  $("lerobotReplayControls").hidden = !lerobot;
+  $("rawReplayControls").hidden = lerobot;
+  $("replayLoopControls").hidden = lerobot;
 }
 
 function rawCollectionId(raw) {
@@ -184,6 +244,18 @@ function policyRunId(policy) {
   return policy.id.includes(marker) ? policy.id.split(marker)[0] : policy.id;
 }
 
+function updatePolicySelectOptions(select, options) {
+  const existing = [...select.options].map((option) => [option.value, option.textContent]);
+  if (JSON.stringify(existing) === JSON.stringify(options)) return;
+  select.innerHTML = "";
+  for (const [value, label] of options) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    select.appendChild(option);
+  }
+}
+
 function fillCheckpointSelect(policies, runId, preferredPolicyId = "") {
   const select = $("policySelect");
   const items = policies
@@ -193,22 +265,13 @@ function fillCheckpointSelect(policies, runId, preferredPolicyId = "") {
       const rightStep = right.step !== null && right.step !== undefined && Number.isFinite(Number(right.step)) ? Number(right.step) : -1;
       return rightStep - leftStep || right.id.localeCompare(left.id, undefined, { numeric: true });
     });
-  select.innerHTML = "";
-  items.forEach((item, index) => {
-    const option = document.createElement("option");
-    option.value = item.id;
+  const options = items.map((item, index) => {
     const checkpoint = item.checkpoint || item.id.split("/").at(-2) || item.id;
-    option.textContent = `${checkpoint}${index === 0 ? " · Latest" : ""} · ${item.type || "unknown"}`;
-    select.appendChild(option);
+    return [item.id, `${checkpoint}${index === 0 ? " · Latest" : ""} · ${item.type || "unknown"}`];
   });
+  updatePolicySelectOptions(select, options.length ? options : [["", "No checkpoint available"]]);
   if ([...select.options].some((option) => option.value === preferredPolicyId)) {
     select.value = preferredPolicyId;
-  }
-  if (!items.length) {
-    const option = document.createElement("option");
-    option.value = "";
-    option.textContent = "No checkpoint available";
-    select.appendChild(option);
   }
 }
 
@@ -226,14 +289,12 @@ function fillPolicySelectors(policies, loadedPolicyId = "") {
   }
   const runs = [...groups.keys()].sort((left, right) => left.localeCompare(right, undefined, { numeric: true }));
   const loaded = policies.find((policy) => policy.id === loadedPolicyId);
-  const selectedRun = loaded
-    ? policyRunId(loaded)
-    : groups.has(currentRun)
+  const selectedRun = groups.has(currentRun)
       ? currentRun
       : groups.has(savedRun)
         ? savedRun
-        : runs[0] || "";
-  runSelect.innerHTML = "";
+        : loaded ? policyRunId(loaded) : runs[0] || "";
+  const options = [];
   for (const runId of runs) {
     const items = groups.get(runId);
     const steps = items
@@ -241,19 +302,16 @@ function fillPolicySelectors(policies, loadedPolicyId = "") {
       .map((item) => Number(item.step))
       .filter(Number.isFinite);
     const latest = steps.length ? Math.max(...steps) : null;
-    const option = document.createElement("option");
-    option.value = runId;
-    option.textContent = `${runId} · ${items.length} ckpt${items.length === 1 ? "" : "s"}${latest === null ? "" : ` · latest ${latest}`}`;
-    runSelect.appendChild(option);
+    options.push([runId, `${runId} · ${items.length} ckpt${items.length === 1 ? "" : "s"}${latest === null ? "" : ` · latest ${latest}`}`]);
   }
+  updatePolicySelectOptions(runSelect, options.length ? options : [["", "No training run available"]]);
   if (selectedRun) runSelect.value = selectedRun;
-  if (!runs.length) {
-    const option = document.createElement("option");
-    option.value = "";
-    option.textContent = "No training run available";
-    runSelect.appendChild(option);
-  }
-  fillCheckpointSelect(policies, selectedRun, loadedPolicyId || currentPolicy || savedPolicy);
+  fillCheckpointSelect(policies, selectedRun, currentPolicy || savedPolicy || loadedPolicyId);
+}
+
+function policySelectionMismatch(server) {
+  const selected = $("policySelect").value;
+  return Boolean(server?.ready && server.policy_id && selected && selected !== server.policy_id);
 }
 
 function fillRltCheckpointSelector(checkpoints, serverCheckpointId = "") {
@@ -429,6 +487,13 @@ function renderRltControls(overview) {
   ) || null;
   const latestOnline = overview.jobs.find((job) => job.kind === "rlt_online_execute") || null;
   state.activeRltOnline = activeOnline;
+  state.latestRltOnline = latestOnline;
+  if (state.teachLabelJobId !== (latestOnline && latestOnline.id)) {
+    state.teachLabelJobId = latestOnline ? latestOnline.id : null;
+    $("teachSegmentList").innerHTML = "";
+    $("saveTeachLabelsButton").disabled = true;
+  }
+  $("loadTeachSegmentsButton").disabled = !latestOnline;
   $("rltCheckpointStatus").textContent = selected
     ? selected.ready ? "Ready" : "Incomplete"
     : "No checkpoint";
@@ -512,7 +577,9 @@ function renderRltControls(overview) {
     : "—";
   $("rltServerEpisode").textContent = rltServer.active_episode
     ? `active · actor ${rltServer.actor_enabled ? "on" : "off"}`
-    : "idle";
+    : activeOnline
+      ? "episode process starting · first action chunk takes 10-15 s after a cold server load"
+      : "idle";
   const canStartRltServer = Boolean(
     selected?.ready && selectedActor?.ready && overview.bridge.online && overview.bridge.devices?.ok
     && !serverBusy && !activeShadow && !activeOnline && !rltServerLocked
@@ -654,6 +721,12 @@ function renderRltControls(overview) {
   $("saveRltSuccessButton").disabled = !canLabel;
   $("saveRltFailureButton").disabled = !canLabel;
   $("abortRltButton").disabled = !canLabel;
+  for (const id of ["phaseCalibrateButton", "phaseRescueButton", "phaseRetreatButton"]) $(id).disabled = !canLabel;
+  if (activeOnline && state.phaseMarkJobId !== activeOnline.id) {
+    state.phaseMarkJobId = activeOnline.id;
+    $("phaseCalibrateButton").checked = true;
+    if (canLabel) void markInterventionPhase("calibrate", true);
+  }
   $("rltOutcomeHint").textContent = activeOnline
     ? resultSubmitted
       ? `Result ${activeOnline.metadata?.result || "submitted"}; post-episode jobs are running with robot output disabled.`
@@ -782,16 +855,36 @@ function renderDevices(devices) {
     const card = document.querySelector(`[data-arm-card="${key}"]`);
     card.classList.toggle("ok", Boolean(arm.ok));
     $(`arm${suffix}Status`).textContent = arm.ok ? "OK" : arm.fresh ? "INVALID" : "STALE";
-    $(`arm${suffix}Meta`).textContent = arm.position?.length === 7
-      ? [
-        `Age      ${formatAge(arm.age_ms)}`,
-        ...arm.position.slice(0, 6).map((q, index) =>
-          `J${index + 1}       ${Number(q).toFixed(3)}`
-        ),
-        `Gripper  ${Number(arm.position[6]).toFixed(3)}`,
-      ].join("\n")
-      : "No joint state";
+    if (!state.jointState) $(`arm${suffix}Meta`).textContent = "等待实时关节反馈…";
   }
+  if (state.jointState) renderJointAngles();
+}
+
+function renderJointAngles() {
+  const arms = state.jointState?.arms || {};
+  for (const [key, suffix] of Object.entries({ master_left: "MasterLeft", master_right: "MasterRight",
+    puppet_left: "PuppetLeft", puppet_right: "PuppetRight" })) {
+    const arm = arms[key];
+    if (!arm || arm.position?.length !== 7) continue;
+    const fresh = arm.fresh && !state.jointState.stale && state.robotStatus?.online !== false;
+    $(`arm${suffix}Meta`).textContent = [
+      fresh ? `低频实时 · ${formatAge(arm.age_ms)}` : "反馈已过期（以下为最后收到的数值）",
+      ...arm.position.slice(0, 6).map((q, i) => `J${i + 1}       ${Number(q).toFixed(3)} rad`),
+      `Gripper  ${Number(arm.position[6]).toFixed(3)} m`,
+    ].join("\n");
+  }
+}
+
+function jointStateStale() {
+  clearTimeout(state.jointWatchdog);
+  if (state.jointState) { state.jointState.stale = true; renderJointAngles(); }
+}
+
+function handleJointState(data) {
+  state.jointState = { ...data, stale: data.age_ms === null || data.age_ms > 1500 };
+  renderJointAngles(); // Display only: no directory scans or motion-button updates.
+  clearTimeout(state.jointWatchdog);
+  state.jointWatchdog = setTimeout(jointStateStale, 2000);
 }
 
 function renderCapabilities(capabilities) {
@@ -806,7 +899,7 @@ function renderCapabilities(capabilities) {
 }
 
 function activateTab(name) {
-  document.body.classList.toggle("document-scroll", name === "rl" || name === "rlt");
+  document.body.classList.toggle("document-scroll", ["il", "rl", "rlt", "data", "system"].includes(name));
   document.querySelectorAll(".module-tab").forEach((tab) => {
     tab.classList.toggle("active", tab.dataset.tab === name);
   });
@@ -887,6 +980,19 @@ function renderIlRecordControl(jobs) {
 function renderPolicyControls(overview) {
   const server = overview.policy_server || { ready: false, state: "offline" };
   state.policyServer = server;
+  const selectedPolicy = (overview.policies || []).find((item) => item.id === $("policySelect").value);
+  const supportsDenoisingSteps = selectedPolicy?.type === "smolvla";
+  const denoisingSelect = $("policyDenoisingSteps");
+  $("policyDenoisingControl").hidden = !supportsDenoisingSteps;
+  if (server.ready && server.policy_type === "smolvla") {
+    denoisingSelect.value = String([5, 10, 20].includes(Number(server.num_steps)) ? server.num_steps : 10);
+  }
+  denoisingSelect.disabled = !supportsDenoisingSteps || server.ready || server.state === "loading";
+  $("policyDenoisingHint").textContent = supportsDenoisingSteps
+    ? server.ready || server.state === "loading"
+      ? `Loaded setting: ${server.num_steps ?? 10} steps. Stop the Model Server before changing it.`
+      : "Controls SmolVLA flow-matching inference steps; the selected value takes effect when Model Server starts."
+    : "Denoising-step override is available for SmolVLA checkpoints only.";
   const guidedRtc = server.inference_chunking === "guided_rtc";
   const serverActionSpace = ["joint", "eef_target"].includes(server.action_space)
     ? server.action_space
@@ -922,18 +1028,23 @@ function renderPolicyControls(overview) {
   badge.textContent = server.ready ? "Ready" : server.state === "loading" ? "Loading" : "Offline";
   badge.className = `badge ${server.ready ? "online" : server.state === "loading" ? "running" : "offline"}`;
   $("policyServerDetail").textContent = server.ready
-    ? `${server.compute === "robot" ? "Robot GPU" : "PC GPU"} · ${server.policy_id || server.policy_path || "model"} · ${guidedRtc ? "Guided RTC terminal" : "Original chunks"} · ${server.device || "device unknown"}`
+    ? `${server.compute === "robot" ? "Robot GPU" : "PC GPU"} · ${server.policy_id || server.policy_path || "model"} · ${guidedRtc ? "Guided RTC terminal" : "Original chunks"}${server.policy_type === "smolvla" ? ` · ${server.num_steps ?? 10} denoise steps` : ""} · ${server.device || "device unknown"}`
     : server.state === "loading"
       ? `Loading checkpoint into ${server.compute === "robot" ? "Robot GPU" : "PC GPU"}…`
       : "No model loaded";
   const selectionLocked = server.ready || server.state === "loading";
+  const pendingSelection = policySelectionMismatch(server);
   if (server.compute && selectionLocked) $("policyComputeSelect").value = server.compute;
   $("policyComputeSelect").disabled = selectionLocked;
   if (server.device && selectionLocked) $("policyDeviceSelect").value = server.device;
   $("policyDeviceSelect").disabled = selectionLocked || $("policyComputeSelect").value === "robot";
   if ($("policyComputeSelect").value === "robot") $("policyDeviceSelect").value = "cuda:0";
-  $("policyRunSelect").disabled = selectionLocked;
-  $("policySelect").disabled = selectionLocked;
+  const checkpointSelectionLocked = server.state === "loading" || Boolean(activeRollout);
+  $("policyRunSelect").disabled = checkpointSelectionLocked;
+  $("policySelect").disabled = checkpointSelectionLocked;
+  $("policySelectionHint").textContent = pendingSelection
+    ? "Selected checkpoint is not loaded. Stop Server, then Start Model Server to load your selection."
+    : server.ready ? "Selected checkpoint matches the loaded model." : "Select a checkpoint, then Start Model Server.";
   if (selectionLocked) $("policyInferenceChunking").value = guidedRtc ? "guided_rtc" : "original";
   $("policyInferenceChunking").disabled = selectionLocked;
   $("policyChunkingHint").textContent = guidedRtc
@@ -964,11 +1075,13 @@ function renderPolicyControls(overview) {
   $("startPolicyServerButton").disabled = server.ready || server.state === "loading"
     || overview.policies.length === 0;
   $("stopPolicyServerButton").disabled = !server.ready && server.state !== "loading";
-  $("startRolloutButton").disabled = !server.ready || Boolean(activeRollout);
-  $("startSyncRolloutButton").disabled = !server.ready || Boolean(activeRollout);
+  $("startRolloutButton").disabled = !server.ready || Boolean(activeRollout) || pendingSelection;
+  $("startSyncRolloutButton").disabled = !server.ready || Boolean(activeRollout) || pendingSelection;
   $("stopRolloutButton").disabled = !activeRollout;
   $("rolloutHint").textContent = activeRollout
     ? `Mode ${activeRollout.metadata?.mode || "?"} rollout is ${activeRollout.state} on ${activeRollout.metadata?.compute === "robot" ? "Robot" : "PC"}. Teach release will end it.`
+    : pendingSelection
+      ? "Load the selected checkpoint before starting rollout. The server still holds the previous model."
     : guidedRtc
       ? "Guided RTC: complete model chunks; each next chunk is softly anchored to the previous terminal target. This first test is synchronous."
     : server.ready
@@ -983,15 +1096,204 @@ function renderReplayControls(overview) {
   state.activeReplay = activeReplay;
   $("startReplayButton").disabled = Boolean(activeReplay);
   $("stopReplayButton").disabled = !activeReplay;
+  for (const id of ["replaySource", "replayDataset", "replayEpisode", "replaySpeed", "replayLoop"]) {
+    $(id).disabled = Boolean(activeReplay);
+  }
+  $("replayMotionConfirm").disabled = Boolean(activeReplay);
+  const stopSafety = activeReplay?.metadata?.stop_safety;
   $("replayHint").textContent = activeReplay
-    ? `Replay is ${activeReplay.state}. Stop Replay sends a controlled stop and returns the robot to SAFE.`
-    : "Teach or Stop Replay immediately ends replay and returns the robot to SAFE.";
+    ? `Replay ${activeReplay.metadata?.source_type === "lerobot" ? `${activeReplay.metadata.dataset_id} · ep${activeReplay.metadata.episode_index}` : "raw episode"} is ${activeReplay.state}.${stopSafety ? (stopSafety.safe ? " Output-off and SAFE were accepted." : ` STOP WARNING: SAFE was not confirmed (${(stopSafety.errors || []).join("; ")}).`) : " Pause / SAFE disables output and ends replay."} It cannot resume from this frame.`
+    : "Pause / SAFE immediately disables output and ends replay. To continue, start the episode again.";
+  renderReplaySourceControls();
 }
 
 async function refresh() {
+  // Manual snapshots only. Repeated clicks share one in-flight request rather
+  // than adding more scans to the already slow overview endpoint.
+  if (state.refreshPromise) return state.refreshPromise;
+  const buttons = [$("refreshButton"), $("refreshJobsButton")].filter(Boolean);
+  for (const button of buttons) button.disabled = true;
+  const hint = $("stateRefreshHint");
+  if (hint) hint.textContent = "正在刷新状态…相机预览保持实时。";
+  state.refreshPromise = refreshSnapshot().then((ok) => {
+    if (hint) hint.textContent = ok
+      ? `目录：${new Date().toLocaleTimeString()}（手动刷新）`
+      : "目录刷新失败，请重试";
+  }).finally(() => {
+    state.refreshPromise = null;
+    for (const button of buttons) button.disabled = false;
+  });
+  return state.refreshPromise;
+}
+
+function overlayRuntime(overview) {
+  const patch = state.runtimePatch;
+  if (patch.jobs) overview.jobs = patch.jobs;
+  if (patch.policy_server) overview.policy_server = patch.policy_server;
+  if (patch.rlt_policy_server) overview.rlt = { ...overview.rlt, policy_server: patch.rlt_policy_server };
+  if (patch.raws.size) {
+    const raws = new Map((overview.raws || []).map((raw) => [raw.id, raw]));
+    for (const [id, raw] of patch.raws) raws.set(id, raw);
+    overview.raws = [...raws.values()].sort((a, b) => b.modified_at_ns - a.modified_at_ns);
+  }
+  mergeRobotStatus(overview);
+}
+
+function mergeRobotStatus(overview) {
+  if (!state.robotStatus) return;
+  const status = state.robotStatus;
+  const old = overview.bridge || {};
+  const devices = { ...(old.devices || {}), ...status.devices };
+  for (const kind of ["arms", "cameras"]) {
+    devices[kind] = { ...(old.devices?.[kind] || {}) };
+    for (const [name, flags] of Object.entries(status.devices?.[kind] || {})) {
+      devices[kind][name] = { ...devices[kind][name], ...flags };
+    }
+  }
+  // Unknown fields must not inherit a stale ENABLED/Teach/mode indication.
+  overview.bridge = { ...old, mode: null, mode_id: null, teach_active: undefined,
+    output_enabled: undefined, emergency_latched: undefined, allow_control: false,
+    ...status, devices };
+}
+
+function updateRobotDisplay() {
+  if (!state.overview) {
+    renderBridge(state.robotStatus || { online: false });
+    return;
+  }
+  mergeRobotStatus(state.overview);
+  renderBridge(state.overview.bridge);
+  renderPolicyControls(state.overview);
+  renderReplayControls(state.overview);
+  renderRltControls(state.overview);
+  renderRobotStartup(state.overview);
+  renderMotionReadiness(state.overview);
+}
+
+function robotStatusStale(reason) {
+  clearTimeout(state.robotWatchdog);
+  jointStateStale();
+  const oldDevices = state.robotStatus?.devices || state.overview?.bridge?.devices || {};
+  const devices = { ok: false, ok_count: 0, total: 7, arms: {}, cameras: {} };
+  for (const name of Object.keys(oldDevices.arms || {})) devices.arms[name] = { ok: false, fresh: false };
+  for (const name of Object.keys(oldDevices.cameras || {})) devices.cameras[name] = { ok: false, fresh: false, has_frame: false };
+  state.robotStatus = { online: false, stale: true, devices };
+  $("robotStatusHint").textContent = `机器人状态已过期 · ${reason}；控制相关状态暂不可确认。`;
+  updateRobotDisplay();
+}
+
+function handleRobotEvent(kind, data) {
+  if (data.age_ms > 1500) { robotStatusStale("后端检测超时"); return; }
+  if (kind === "robot_status_changed") {
+    state.robotStatus = data.status;
+    state.eventVersion += 1;
+    updateRobotDisplay();
+  }
+  clearTimeout(state.robotWatchdog);
+  state.robotWatchdog = setTimeout(() => robotStatusStale("超过3秒未收到状态心跳"), 3000);
+  $("robotStatusHint").textContent = `${state.robotStatus?.online ? "机器人在线" : "Bridge 离线"} · ${new Date().toLocaleTimeString()} · 状态切换优先 / 关节 2 Hz`;
+}
+
+function handleRuntimeEvent(kind, data) {
+  if (kind === "joint_state") { handleJointState(data); return; }
+  if (["robot_status_changed", "robot_heartbeat"].includes(kind)) {
+    handleRobotEvent(kind, data);
+    return; // Do not rebuild directory selectors or scan anything on status changes.
+  }
+  const patch = state.runtimePatch;
+  if (kind === "runtime_snapshot") {
+    patch.jobs = data.jobs;
+    for (const raw of data.raws || []) patch.raws.set(raw.id, raw);
+    if (data.policy_server) patch.policy_server = data.policy_server;
+    if (data.rlt_policy_server) patch.rlt_policy_server = data.rlt_policy_server;
+  } else if (kind === "job_changed") {
+    patch.jobs = data.jobs;
+    if (data.raw) patch.raws.set(data.raw.id, data.raw);
+  } else if (kind === "server_changed") {
+    if (!["policy_server", "rlt_policy_server"].includes(data.name)) return;
+    patch[data.name] = data.status;
+  } else return;
+  state.eventVersion += 1;
+  if (state.overview) {
+    overlayRuntime(state.overview);
+    renderJobs(state.overview.jobs);
+    renderIlRecordControl(state.overview.jobs);
+    renderRlRecordControl(state.overview.jobs);
+    renderPolicyControls(state.overview);
+    renderReplayControls(state.overview);
+    renderRltControls(state.overview);
+    renderRobotStartup(state.overview);
+    renderMotionReadiness(state.overview);
+    if (data.raw || data.raws?.length) fillRawSelectors(state.overview.raws.filter((raw) => raw.completed));
+  }
+  if (kind === "job_changed") {
+    if (["robot_startup", "robot_self_check"].includes(data.job.kind) && data.job.state === "completed") {
+      toast(data.job.kind === "robot_startup" ? "机器人服务已就绪，运动输出保持关闭。" : "自检完成，请查看报告。");
+    }
+    if (["record", "record_with_init"].includes(data.job.kind) && data.raw?.completed) {
+      const outcome = data.raw.outcome === "success" ? "成功" : data.raw.outcome === "failure" ? "失败" : data.raw.outcome;
+      const message = `录制已保存 · ${outcome} · ${data.raw.episode}`;
+      if (data.raw.collection_type === "IL" && !state.activeIlRecord) $("ilRecordHint").textContent = message;
+      toast(message);
+    } else if (data.job.state === "failed") {
+      toast(`${data.job.kind} 已停止或失败，请查看任务日志。`, true);
+    }
+    if (state.selectedJob === data.job.id) refreshLog();
+  }
+}
+
+async function startRuntimeEvents() {
+  const hint = $("runtimeEventHint");
+  state.robotWatchdog = setTimeout(() => robotStatusStale("尚未收到机器人状态"), 3000);
+  while (!state.eventsStopped) {
+    state.eventController = new AbortController();
+    try {
+      const requestHeaders = headers();
+      if (state.eventCursor !== null) requestHeaders["Last-Event-ID"] = state.eventCursor;
+      const response = await fetch("/api/events", { headers: requestHeaders, signal: state.eventController.signal });
+      if (!response.ok || !response.body) throw new Error(`HTTP ${response.status}`);
+      if (hint) hint.textContent = "SSE 已连接（状态 / 任务 / 模型自动更新）";
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      try {
+        while (!state.eventsStopped) {
+          const { value, done } = await reader.read();
+          if (done) throw new Error("通知连接已断开");
+          buffer += decoder.decode(value, { stream: true });
+          if (buffer.length > 2 * 1024 * 1024) throw new Error("通知消息过大");
+          let end;
+          while ((end = buffer.indexOf("\n\n")) >= 0) {
+            const frame = buffer.slice(0, end); buffer = buffer.slice(end + 2);
+            let id = null, kind = "message"; const lines = [];
+            for (const line of frame.split("\n")) {
+              if (line.startsWith("id:")) id = line.slice(3).trim();
+              if (line.startsWith("event:")) kind = line.slice(6).trim();
+              if (line.startsWith("data:")) lines.push(line.slice(5).trimStart());
+            }
+            if (lines.length) {
+              handleRuntimeEvent(kind, JSON.parse(lines.join("\n")));
+              if (id !== null) state.eventCursor = id;
+            }
+          }
+        }
+      } finally { await reader.cancel().catch(() => {}); }
+    } catch (error) {
+      if (state.eventsStopped) break;
+      robotStatusStale("SSE 连接断开");
+      if (hint) hint.textContent = "SSE 断线，正在重连";
+    }
+    if (!state.eventsStopped) await new Promise((resolve) => setTimeout(resolve, 3000));
+  }
+}
+
+async function refreshSnapshot() {
   try {
+    const eventVersion = state.eventVersion;
     const liveNow = LIVE_CAMERA_NAMES.filter((name) => state.preview[name]).join(",");
     const overview = await api(liveNow ? `/api/overview?live_cameras=${encodeURIComponent(liveNow)}` : "/api/overview");
+    if (!state.overview || state.eventVersion !== eventVersion) overlayRuntime(overview);
+    else mergeRobotStatus(overview); // Slow overview must never replace live control status.
     state.overview = overview;
     renderBridge(overview.bridge);
     renderCapabilities(overview.capabilities);
@@ -1004,6 +1306,7 @@ async function refresh() {
     renderIlRecordControl(overview.jobs);
     renderRlRecordControl(overview.jobs);
     fillRawSelectors(overview.raws.filter((item) => item.completed));
+    fillLerobotReplayDatasets(overview.lerobot_replay_datasets || []);
     renderReplayControls(overview);
     fillPolicySelectors(overview.policies, overview.policy_server?.policy_id || "");
     renderPolicyControls(overview);
@@ -1012,7 +1315,21 @@ async function refresh() {
       overview.rlt?.policy_server?.checkpoint_id || "",
     );
     renderRltControls(overview);
+    renderRobotStartup(overview);
     $("rlAutoStartPolicy").disabled = false;
+    renderMotionReadiness(overview);
+    $("dataRootHint").textContent = `Raw: ${overview.paths.raw_root} · Datasets: ${overview.paths.dataset_root}`;
+    if (state.selectedJob) await refreshLog();
+    return true;
+  } catch (error) {
+    if (state.robotStatus) updateRobotDisplay();
+    else renderBridge({ online: false });
+    toast(error.message, true);
+    return false;
+  }
+}
+
+function renderMotionReadiness(overview) {
     const motionKinds = [
       "replay_execute", "policy_execute", "rlt_policy_execute", "rlt_online_execute", "init_pose_execute"
     ];
@@ -1025,7 +1342,7 @@ async function refresh() {
       motionKinds.includes(job.kind) && ["running", "stopping"].includes(job.state)
     ) || initRecordBusy;
     const restartBusy = overview.jobs.some((job) =>
-      job.kind === "device_restart" && ["running", "stopping"].includes(job.state)
+      ["device_restart", "robot_startup", "robot_self_check"].includes(job.kind) && ["running", "stopping"].includes(job.state)
     );
     const recordBusy = overview.jobs.some((job) =>
       ["record", "record_with_init"].includes(job.kind)
@@ -1055,12 +1372,6 @@ async function refresh() {
     $("startIlWithInitButton").textContent = initRecordBusy
       ? "Initializing…"
       : "Init → 开始 IL 录制";
-    $("dataRootHint").textContent = `Raw: ${overview.paths.raw_root} · Datasets: ${overview.paths.dataset_root}`;
-    if (state.selectedJob) await refreshLog();
-  } catch (error) {
-    renderBridge({ online: false });
-    toast(error.message, true);
-  }
 }
 
 async function selectJob(job) {
@@ -1171,6 +1482,9 @@ async function startRl() {
       if (!state.policyServer?.ready) {
         throw new Error("Start Model Server and wait for Ready before auto-starting rollout");
       }
+      if (policySelectionMismatch(state.policyServer)) {
+        throw new Error("Load the selected checkpoint before auto-starting rollout");
+      }
       if (!$("rolloutMotionConfirm").checked) {
         throw new Error("Enable the real-motion confirmation in Policy Rollout first");
       }
@@ -1220,17 +1534,42 @@ async function startReplay() {
   if (!$("replayMotionConfirm").checked) return toast("请先确认 replay 真实运动安全条件", true);
   if (!window.confirm("Replay recorded actions on the real robot?")) return;
   try {
-    if (!$("convertRaw").value) throw new Error("No episode selected in Data browser");
-    const result = await api("/api/jobs/replay", {
-      method: "POST",
-      body: JSON.stringify({
-        raw_id: $("convertRaw").value, side: "right", source: "puppet_command",
-        mode: "sync", waypoint_hz: 30, speed_scale: Number($("replaySpeed").value),
-        loop: $("replayLoop").checked, execute: true, confirm_motion: true,
-      }),
-    });
+    let result;
+    if ($("replaySource").value === "lerobot") {
+      const dataset = (state.overview?.lerobot_replay_datasets || [])
+        .find((item) => item.id === $("replayDataset").value);
+      const episodeIndex = Number($("replayEpisode").value);
+      if (!dataset) throw new Error("Select a LeRobot dataset first");
+      if (!Number.isInteger(episodeIndex) || episodeIndex < 0 || episodeIndex >= dataset.episodes) {
+        throw new Error(`Episode index must be between 0 and ${dataset.episodes - 1}`);
+      }
+      result = await api("/api/jobs/replay-lerobot", {
+        method: "POST",
+        body: JSON.stringify({
+          dataset_id: dataset.id,
+          episode_index: episodeIndex,
+          side: "right",
+          waypoint_hz: 30,
+          speed_scale: Number($("replaySpeed").value),
+          alignment_speed: 0.05,
+          alignment_min_seconds: 5,
+          execute: true,
+          confirm_motion: true,
+        }),
+      });
+    } else {
+      if (!$("convertRaw").value) throw new Error("No raw episode selected in Data browser");
+      result = await api("/api/jobs/replay", {
+        method: "POST",
+        body: JSON.stringify({
+          raw_id: $("convertRaw").value, side: "right", source: "puppet_command",
+          mode: "sync", waypoint_hz: 30, speed_scale: Number($("replaySpeed").value),
+          loop: $("replayLoop").checked, execute: true, confirm_motion: true,
+        }),
+      });
+    }
     state.selectedJob = result.id;
-    toast("Selected episode replay started. This is a trajectory test, not RL collection.");
+    toast("Replay started. Use Pause / SAFE whenever you want to stop at the current point.");
     await refresh();
   } catch (error) { toast(error.message, true); }
 }
@@ -1238,8 +1577,15 @@ async function startReplay() {
 async function stopReplay() {
   if (!state.activeReplay) return toast("No active replay", true);
   try {
-    await api(`/api/jobs/${state.activeReplay.id}`, { method: "DELETE" });
-    toast("Replay is stopping; robot output will return to SAFE.");
+    const result = await api(`/api/jobs/${state.activeReplay.id}`, { method: "DELETE" });
+    const safety = result.metadata?.stop_safety;
+    if (safety && !safety.safe) {
+      toast(`Replay stopped, but SAFE was not confirmed: ${(safety.errors || []).join("; ")}`, true);
+    } else if (safety?.safe) {
+      toast("Pause / SAFE accepted: output disabled and replay is stopping.");
+    } else {
+      toast("Replay stop requested, but no SAFE acknowledgement was returned. Check System output status.", true);
+    }
     await refresh();
   } catch (error) { toast(error.message, true); }
 }
@@ -1251,6 +1597,9 @@ function validatePolicySelection() {
 }
 
 async function launchPolicy(mode = 2) {
+  if (policySelectionMismatch(state.policyServer)) {
+    throw new Error("Selected checkpoint is not loaded. Stop Server, then Start Model Server first.");
+  }
   const actionStepsValue = $("rolloutActionSteps").value.trim();
   const actionSpace = $("rolloutActionSpace").value;
   if (["eef_delta", "eef_target"].includes(actionSpace) && mode === 2 && $("rolloutEefIkBackend").value !== "pink") {
@@ -1287,6 +1636,7 @@ async function launchPolicy(mode = 2) {
 async function startPolicyServer() {
   try {
     validatePolicySelection();
+    const selectedPolicy = (state.overview?.policies || []).find((item) => item.id === $("policySelect").value);
     const result = await api("/api/policy-server/start", {
       method: "POST",
       body: JSON.stringify({
@@ -1294,6 +1644,7 @@ async function startPolicyServer() {
         device: $("policyDeviceSelect").value,
         compute: $("policyComputeSelect").value,
         inference_chunking: $("policyInferenceChunking").value,
+        num_steps: selectedPolicy?.type === "smolvla" ? Number($("policyDenoisingSteps").value) : null,
       }),
     });
     if (result.id) state.selectedJob = result.id;
@@ -1314,6 +1665,7 @@ async function stopPolicyServer() {
 
 async function startRollout(mode) {
   if (!state.policyServer?.ready) return toast("Model Server is not Ready", true);
+  if (policySelectionMismatch(state.policyServer)) return toast("Load the selected checkpoint first", true);
   if (!$("rolloutMotionConfirm").checked) return toast("请先确认 rollout 真实运动安全条件", true);
   const target = mode === 2 ? "right master + puppet with individual alignment" : "right puppet only";
   if (!window.confirm(`Run Mode ${mode} policy on ${target}?`)) return;
@@ -1446,6 +1798,7 @@ async function startRltOnline(workflowMode) {
         rollout_speed: Number($("rltRolloutSpeed").value),
         smooth_profile: $("rltSmoothProfile").value,
         actor_eef_gate: $("rltActorEefGate").checked,
+        actor_max_decisions: Number($("rltActorDecisionBudget").value),
         max_seconds: 3600,
         actor_exploration_std: Number($("rltExplorationStd").value),
         q_select_k: Number($("rltQSelect")?.value || 0),
@@ -1454,7 +1807,8 @@ async function startRltOnline(workflowMode) {
       }),
     });
     state.selectedJob = result.id;
-    toast(`${modeName} started with trained actor enabled=${result.actor_enabled}.`);
+    toast(`${modeName} started with trained actor enabled=${result.actor_enabled}. `
+      + "The arm holds still for 10-15 s while the first chunk is planned.");
     await refresh();
   } catch (error) { toast(error.message, true); }
 }
@@ -1518,6 +1872,68 @@ async function abortRlt() {
   } catch (error) { toast(error.message, true); }
 }
 
+async function markInterventionPhase(phase, quiet = false) {
+  const job = state.activeRltOnline;
+  if (!job) {
+    if (!quiet) toast("No active Online RLT episode", true);
+    return;
+  }
+  try {
+    await api(`/api/jobs/${job.id}/intervention-phase`, { method: "POST", body: JSON.stringify({ phase }) });
+    if (!quiet) $("interventionPhaseHint").textContent = `已标记 ${phase} @ ${new Date().toLocaleTimeString()}；该时刻之后的 Teach 段按此类型入库。`;
+  } catch (error) {
+    if (!quiet) toast(error.message, true);
+    else console.warn("intervention-phase mark failed:", error);
+  }
+}
+for (const id of ["phaseCalibrateButton", "phaseRescueButton", "phaseRetreatButton"]) {
+  $(id).onchange = () => {
+    const selected = document.querySelector('input[name="interventionPhase"]:checked');
+    if (selected) markInterventionPhase(selected.value);
+  };
+}
+
+async function loadTeachSegments() {
+  const job = state.latestRltOnline;
+  if (!job) return toast("没有可标注的 Online RLT episode", true);
+  try {
+    const result = await api(`/api/jobs/${job.id}/teach-segments`);
+    const list = $("teachSegmentList");
+    list.innerHTML = "";
+    if (!result.segments.length) {
+      list.innerHTML = '<p class="hint">本 episode 未检测到 Teach 介入段（全程自主），无需补标。</p>';
+    }
+    for (const seg of result.segments) {
+      const row = document.createElement("div");
+      row.className = "hint";
+      row.innerHTML = `Teach 段 ${seg.index + 1} · t+${seg.start_s}s · ${seg.dur_s}s　` +
+        [["calibrate", "校准"], ["rescue", "救援"], ["retreat", "撤离"]].map(([value, label]) =>
+          `<label><input type="radio" name="teach_seg_${seg.index}" value="${value}"${value === "calibrate" ? " checked" : ""}> ${label}</label>`
+        ).join(" ");
+      list.appendChild(row);
+    }
+    $("saveTeachLabelsButton").disabled = !result.segments.length;
+    $("teachSegmentHint").textContent = `检测到 ${result.segments.length} 个 Teach 段；选好后点“保存补标”，可反复修改，以最后一次为准。`;
+  } catch (error) { toast(error.message, true); }
+}
+
+async function saveTeachLabels() {
+  const job = state.latestRltOnline;
+  if (!job) return;
+  const labels = [...$("teachSegmentList").querySelectorAll('input[type="radio"]:checked')].map((input) => ({
+    index: Number(input.name.replace("teach_seg_", "")),
+    phase: input.value,
+  }));
+  if (!labels.length) return toast("没有可保存的标注", true);
+  try {
+    const result = await api(`/api/jobs/${job.id}/teach-labels`, { method: "POST", body: JSON.stringify({ labels }) });
+    $("teachSegmentHint").textContent = `已保存 ${result.labeled}/${result.segments} 段标注；下次训练加载 replay 时自动生效。`;
+    toast("Teach 段补标已保存。");
+  } catch (error) { toast(error.message, true); }
+}
+$("loadTeachSegmentsButton").onclick = loadTeachSegments;
+$("saveTeachLabelsButton").onclick = saveTeachLabels;
+
 async function convertRaw() {
   try {
     if (!$("convertRaw").value) throw new Error("No raw episode selected");
@@ -1538,12 +1954,12 @@ async function convertRaw() {
 }
 
 async function emergencySafe() {
-  try { await api("/api/emergency-safe", { method: "POST" }); toast("Stop latched for policy. Physical Teach remains highest priority."); await refresh(); }
+  try { await api("/api/emergency-safe", { method: "POST" }); toast("Stop latched for policy. Physical Teach remains highest priority."); }
   catch (error) { toast(error.message, true); }
 }
 
 async function clearEmergency() {
-  try { await api("/api/clear-emergency", { method: "POST" }); toast("Stop latch cleared; mode remains SAFE and policy output remains off."); await refresh(); }
+  try { await api("/api/clear-emergency", { method: "POST" }); toast("Stop latch cleared; mode remains SAFE and policy output remains off."); }
   catch (error) { toast(error.message, true); }
 }
 
@@ -1554,6 +1970,42 @@ async function restartDevices() {
     toast("Restarting four arms and all three cameras. Waiting for 7/7 OK.");
     await refresh();
   } catch (error) { toast(error.message, true); }
+}
+
+function renderRobotStartup(overview) {
+  const active = (job) => ["running", "stopping"].includes(job.state);
+  const busy = overview.jobs.some((job) => active(job) && [
+    "robot_startup", "robot_self_check", "device_restart", "record", "record_with_init",
+    "policy_execute", "replay_execute", "rlt_policy_execute", "rlt_online_execute", "init_pose_execute",
+  ].includes(job.kind));
+  $("startRobotButton").disabled = busy || overview.bridge?.teach_active || overview.bridge?.output_enabled;
+  $("checkRobotButton").disabled = busy;
+  const job = overview.jobs.find((job) => ["robot_startup", "robot_self_check"].includes(job.kind));
+  if (!job) return;
+  const report = job.metadata?.startup_report || {};
+  const phases = {queued: "排队中", self_check: "自检", plan: "生成补启动计划", start_bridge: "启动 bridge",
+    configure_can: "配置 CAN", start_arms: "启动四臂驱动", start_cameras: "启动相机",
+    start_preview: "启动本地预览", verify: "复检并等待数据持续更新", ready: "服务就绪（输出关闭）",
+    checked: "只读自检完成", failed: "启动未完成"};
+  $("robotStartupHint").textContent = `${phases[report.phase] || job.state} · ${report.error || report.message || "进度和详细原因见报告 / Jobs & Logs"}`;
+  $("robotStartupReport").textContent = JSON.stringify(report, null, 2);
+  $("restartDevicesButton").disabled = busy || overview.bridge?.teach_active;
+}
+
+async function startRobot(checkOnly = false) {
+  $("startRobotButton").disabled = true;
+  $("checkRobotButton").disabled = true;
+  try {
+    const result = await api("/api/system/start-robot", {
+      method: "POST", body: JSON.stringify({ check_only: checkOnly }),
+    });
+    state.selectedJob = result.id;
+    toast(checkOnly ? "开始只读自检" : "开始自检并补启动缺失服务；不会移动机械臂");
+    await refresh();
+  } catch (error) {
+    toast(error.message, true);
+    if (state.overview) renderRobotStartup(state.overview);
+  }
 }
 
 async function moveInitPose() {
@@ -1597,15 +2049,24 @@ $("policyRunSelect").onchange = () => {
   localStorage.setItem(POLICY_RUN_STORAGE_KEY, runId);
   fillCheckpointSelect(state.overview?.policies || [], runId);
   localStorage.setItem(POLICY_CHECKPOINT_STORAGE_KEY, $("policySelect").value);
+  if (state.overview) renderPolicyControls(state.overview);
 };
 $("policySelect").onchange = () => {
   localStorage.setItem(POLICY_RUN_STORAGE_KEY, $("policyRunSelect").value);
   localStorage.setItem(POLICY_CHECKPOINT_STORAGE_KEY, $("policySelect").value);
+  if (state.overview) renderPolicyControls(state.overview);
 };
 $("policyComputeSelect").onchange = () => {
   const robot = $("policyComputeSelect").value === "robot";
   if (robot) $("policyDeviceSelect").value = "cuda:0";
   $("policyDeviceSelect").disabled = robot;
+};
+const savedDenoisingSteps = localStorage.getItem(POLICY_DENOISING_STEPS_STORAGE_KEY);
+if (["5", "10", "20"].includes(savedDenoisingSteps)) {
+  $("policyDenoisingSteps").value = savedDenoisingSteps;
+}
+$("policyDenoisingSteps").onchange = () => {
+  localStorage.setItem(POLICY_DENOISING_STEPS_STORAGE_KEY, $("policyDenoisingSteps").value);
 };
 $("policyInferenceChunking").onchange = () => {
   if ($("policyInferenceChunking").value === "guided_rtc") {
@@ -1620,10 +2081,20 @@ $("convertRawCollection").onchange = () => {
     $("convertRawCollection").value,
   );
 };
+$("replaySource").onchange = renderReplaySourceControls;
+$("replayDataset").onchange = () => {
+  localStorage.setItem(REPLAY_DATASET_STORAGE_KEY, $("replayDataset").value);
+  fillLerobotReplayDatasets(state.overview?.lerobot_replay_datasets || []);
+};
+$("replayEpisode").onchange = () => {
+  localStorage.setItem(REPLAY_EPISODE_STORAGE_KEY, $("replayEpisode").value);
+};
 $("convertButton").onclick = convertRaw;
 $("safeButton").onclick = emergencySafe;
 $("exitStopButton").onclick = clearEmergency;
 $("restartDevicesButton").onclick = restartDevices;
+$("startRobotButton").onclick = () => startRobot(false);
+$("checkRobotButton").onclick = () => startRobot(true);
 $("moveInitPoseButton").onclick = moveInitPose;
 $("moveRlInitPoseButton").onclick = moveInitPose;
 $("moveRltInitPoseButton").onclick = moveInitPose;
@@ -1648,5 +2119,11 @@ const savedTab = localStorage.getItem("cobot_dashboard_tab");
 activateTab(knownTabs.includes(requestedTab) ? requestedTab : knownTabs.includes(savedTab) ? savedTab : "il");
 renderPreviewRoute();
 refresh();
-state.polling = setInterval(refresh, 2500);
+startRuntimeEvents();
+window.addEventListener("beforeunload", () => {
+  state.eventsStopped = true;
+  state.eventController?.abort();
+});
+// Initial snapshot and action-triggered refreshes are retained; periodic
+// overview/log polling is intentionally disabled. MJPEG remains independent.
 for (const name of LIVE_CAMERA_NAMES) startMjpegCamera(name); // latest-only preview, route shown in UI

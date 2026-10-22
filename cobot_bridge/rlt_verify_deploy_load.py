@@ -37,9 +37,6 @@ from lerobot.policies.smolvla_rlt.configuration_smolvla_rlt import (  # noqa: E4
 from lerobot.policies.smolvla_rlt.modeling_smolvla_rlt import (  # noqa: E402
     RLCriticMLP, RLActorMLP)
 
-CHUNK = 10
-
-
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--checkpoint", type=Path, required=True)
@@ -96,24 +93,30 @@ def main() -> None:
     n = arrays["rewards"].shape[0]
     z = torch.tensor(arrays["z_rl"][0], dtype=torch.float32, device=args.device).unsqueeze(0)
     s = torch.tensor(arrays["state"][0], dtype=torch.float32, device=args.device).unsqueeze(0)
+    action_steps = int(actor_config.n_action_steps_rl)
     ref = torch.tensor(arrays["ref_actions"][0], dtype=torch.float32,
-                       device=args.device).view(1, CHUNK, 7)
+                       device=args.device).view(1, action_steps, 7)
+    residual_scale = float(actor_config.actor_residual_scale)
     with torch.no_grad():
         c, _ = actor(z, s, ref, training=False)
         # server path: compose_actor_action with the checkpoint's scale/residual_scale
         server_action = compose_actor_action(
             c, ref, scale.to(args.device),
             output_semantics=ck["actor_output_semantics"],
-            residual_scale=float(ck["actor_residual_scale"]))
-        # training path (rlt_offline_tuned_train.compose_action)
-        from cobot_bridge.rlt_offline_tuned_train import compose_action as train_compose
-        train_action = train_compose(ref, c, float(ck["actor_residual_scale"]))
-    diff = (server_action - train_action).abs().max().item()
-    check("train==deploy compose parity", diff == 0.0, f"maxdiff={diff:.3e}")
+            residual_scale=residual_scale)
+        # Independent expansion of the residual-v4 checkpoint contract.
+        shaped_scale = scale.to(args.device).reshape(1, 1, -1)
+        manual_action = torch.clamp(
+            ref + shaped_scale * residual_scale * torch.tanh(c),
+            min=-shaped_scale,
+            max=shaped_scale,
+        )
+    diff = (server_action - manual_action).abs().max().item()
+    check("compose contract parity", diff == 0.0, f"maxdiff={diff:.3e}")
 
     # ── sane output: bounded correction, ref passthrough shape ──
     corr = (server_action - ref).abs()
-    bound = scale.to(args.device).reshape(1, 1, -1) * float(ck["actor_residual_scale"]) + 1e-6
+    bound = scale.to(args.device).reshape(1, 1, -1) * residual_scale + 1e-6
     check("correction bounded by scale*residual_scale",
           bool((corr <= bound).all()),
           f"corr_max={corr.max().item():.5f}")

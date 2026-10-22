@@ -373,6 +373,11 @@ def _load_policy(args: argparse.Namespace):
     config = PreTrainedConfig.from_pretrained(args.policy_path)
     if args.device:
         config.device = args.device
+    requested_num_steps = getattr(args, "num_steps", None)
+    if requested_num_steps is not None:
+        if not hasattr(config, "num_steps"):
+            raise ValueError("denoising-step override is supported only for SmolVLA policies")
+        config.num_steps = int(requested_num_steps)
     vlm_model_path = getattr(args, "vlm_model_path", None)
     if vlm_model_path and hasattr(config, "vlm_model_name"):
         config.vlm_model_name = vlm_model_path

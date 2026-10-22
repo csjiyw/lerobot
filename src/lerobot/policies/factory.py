@@ -309,26 +309,49 @@ def make_pre_post_processors(
             kwargs["preprocessor_overrides"] = preprocessor_overrides
             kwargs["postprocessor_overrides"] = postprocessor_overrides
 
-        return (
-            PolicyProcessorPipeline.from_pretrained(
-                pretrained_model_name_or_path=pretrained_path,
-                config_filename=kwargs.get(
-                    "preprocessor_config_filename", f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json"
-                ),
-                overrides=kwargs.get("preprocessor_overrides", {}),
-                to_transition=batch_to_transition,
-                to_output=transition_to_batch,
+        preprocessor = PolicyProcessorPipeline.from_pretrained(
+            pretrained_model_name_or_path=pretrained_path,
+            config_filename=kwargs.get(
+                "preprocessor_config_filename", f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json"
             ),
-            PolicyProcessorPipeline.from_pretrained(
-                pretrained_model_name_or_path=pretrained_path,
-                config_filename=kwargs.get(
-                    "postprocessor_config_filename", f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json"
-                ),
-                overrides=kwargs.get("postprocessor_overrides", {}),
-                to_transition=policy_action_to_transition,
-                to_output=transition_to_policy_action,
-            ),
+            overrides=kwargs.get("preprocessor_overrides", {}),
+            to_transition=batch_to_transition,
+            to_output=transition_to_batch,
         )
+        if isinstance(policy_cfg, SmolVLAConfig) and (
+            policy_cfg.eef_relative_in_dataset or policy_cfg.eef_relative_in_gpu
+        ):
+            # The dataset worker (eef_relative_in_dataset) or a vectorized GPU
+            # step inserted below (eef_relative_in_gpu) already handles the
+            # relative transform; drop the checkpoint's saved CPU relative-EEF
+            # step to avoid transforming twice.
+            from lerobot.policies.smolvla.processor_smolvla import (
+                SmolVLARelativeEEFChunkGPUProcessor,
+                SmolVLARelativeEEFChunkProcessor,
+            )
+
+            preprocessor.steps = [
+                step for step in preprocessor.steps if not isinstance(step, SmolVLARelativeEEFChunkProcessor)
+            ]
+            if policy_cfg.eef_relative_in_gpu:
+                from lerobot.processor import DeviceProcessorStep
+
+                device_idx = next(
+                    i for i, step in enumerate(preprocessor.steps) if isinstance(step, DeviceProcessorStep)
+                )
+                preprocessor.steps.insert(
+                    device_idx + 1, SmolVLARelativeEEFChunkGPUProcessor()
+                )
+        postprocessor = PolicyProcessorPipeline.from_pretrained(
+            pretrained_model_name_or_path=pretrained_path,
+            config_filename=kwargs.get(
+                "postprocessor_config_filename", f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json"
+            ),
+            overrides=kwargs.get("postprocessor_overrides", {}),
+            to_transition=policy_action_to_transition,
+            to_output=transition_to_policy_action,
+        )
+        return preprocessor, postprocessor
 
     # Create a new processor based on policy type
     if isinstance(policy_cfg, TDMPCConfig):

@@ -93,6 +93,21 @@ def test_edge_window_can_use_policy_rate_kinematic_limits():
     assert steps > 3
 
 
+def test_takeover_edge_window_can_be_forced_longer_than_normal_edge():
+    previous = np.zeros(7)
+    edge = np.full(7, 0.01)
+    steps, _ = adaptive_edge_blend_steps(
+        previous,
+        edge,
+        min_steps=15,
+        max_steps=30,
+        max_joint_step=0.08,
+        action_hz=30.0,
+    )
+
+    assert steps >= 15
+
+
 def test_policy_rate_limiter_keeps_30_hz_command_differences_bounded():
     limiter = PolicyRateCommandLimiter(action_hz=30.0)
     limiter.reset(np.zeros(7))

@@ -604,6 +604,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         root: str | Path | None = None,
         episodes: list[int] | None = None,
         image_transforms: Callable | None = None,
+        relative_eef_actions: bool = False,
         delta_timestamps: dict[str, list[float]] | None = None,
         tolerance_s: float = 1e-4,
         revision: str | None = None,
@@ -742,6 +743,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.repo_id = repo_id
         self.root = Path(root) if root else HF_LEROBOT_HOME / repo_id
         self.image_transforms = image_transforms
+        self.relative_eef_actions = relative_eef_actions
         self.delta_timestamps = delta_timestamps
         self.episodes = episodes
         self.tolerance_s = tolerance_s
@@ -798,9 +800,30 @@ class LeRobotDataset(torch.utils.data.Dataset):
             }
 
         # Setup delta_indices
+        self._column_cache: dict = {}
         if self.delta_timestamps is not None:
             check_delta_timestamps(self.delta_timestamps, self.fps, self.tolerance_s)
             self.delta_indices = get_delta_indices(self.delta_timestamps, self.fps)
+            # Pre-materialize the queried parquet columns into numpy arrays so that
+            # per-sample delta queries become O(1) fancy indexing instead of
+            # re-materializing HF Dataset rows (list indexing is ~40ms/sample on
+            # this fork's chunk30 relative-EEF config). Built in the parent
+            # process so DataLoader forked workers inherit it copy-on-write.
+            for key in set(self.delta_indices) | {"timestamp"}:
+                if key in self.meta.video_keys:
+                    continue
+                try:
+                    col = np.asarray(self.hf_dataset[key])
+                except Exception:
+                    col = None
+                if col is not None and col.dtype == object:
+                    try:
+                        col = np.stack([np.asarray(v) for v in col])
+                    except Exception:
+                        col = None
+                if col is not None and not (col.dtype.kind in "fiub" or col.dtype == object):
+                    col = None
+                self._column_cache[key] = col
 
         # Initialize streaming encoder for resumed recording
         if streaming_encoding and len(self.meta.video_keys) > 0:
@@ -1039,13 +1062,17 @@ class LeRobotDataset(torch.utils.data.Dataset):
         query_indices: dict[str, list[int]] | None = None,
     ) -> dict[str, list[float]]:
         query_timestamps = {}
+        ts_col = self._column_cache.get("timestamp")
         for key in self.meta.video_keys:
             if query_indices is not None and key in query_indices:
                 if self._absolute_to_relative_idx is not None:
                     relative_indices = [self._absolute_to_relative_idx[idx] for idx in query_indices[key]]
-                    timestamps = self.hf_dataset[relative_indices]["timestamp"]
                 else:
-                    timestamps = self.hf_dataset[query_indices[key]]["timestamp"]
+                    relative_indices = query_indices[key]
+                if ts_col is not None:
+                    query_timestamps[key] = ts_col[relative_indices].astype(np.float64).tolist()
+                    continue
+                timestamps = self.hf_dataset[relative_indices]["timestamp"]
                 query_timestamps[key] = torch.stack(timestamps).tolist()
             else:
                 query_timestamps[key] = [current_ts]
@@ -1074,6 +1101,13 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 if self._absolute_to_relative_idx is None
                 else [self._absolute_to_relative_idx[idx] for idx in q_idx]
             )
+            col = self._column_cache.get(key)
+            if col is not None:
+                try:
+                    result[key] = torch.from_numpy(np.ascontiguousarray(col[relative_indices]))
+                    continue
+                except (IndexError, TypeError, ValueError):
+                    pass  # fall back to the generic HF path below
             try:
                 result[key] = torch.stack(self.hf_dataset[key][relative_indices])
             except (KeyError, TypeError, IndexError):
@@ -1131,6 +1165,52 @@ class LeRobotDataset(torch.utils.data.Dataset):
     def __len__(self):
         return self.num_frames
 
+    def __getitems__(self, indices) -> list[dict]:
+        """Decode each episode-local consecutive group once per camera.
+
+        The cache lasts only for this batch. Action chunks, padding, tasks and
+        image augmentation still use __getitem__ independently for each anchor.
+        Distant groups in the same episode are never merged into a long seek.
+        """
+        if not getattr(self, "batch_video_decode", False) or not self.meta.video_keys:
+            return [self[index] for index in indices]
+        self._ensure_hf_dataset_loaded()
+        records = []
+        for index in indices:
+            item = self.hf_dataset[index]
+            ep = int(item["episode_index"].item())
+            absolute = int(item["index"].item())
+            queries = self._get_query_indices(absolute, ep)[0] if self.delta_indices is not None else None
+            timestamps = self._get_query_timestamps(item["timestamp"].item(), queries)
+            records.append((absolute, index, ep, timestamps))
+        records.sort(key=lambda record: (record[2], record[0]))
+        groups = []
+        for record in records:
+            if not groups or groups[-1][-1][2] != record[2] or record[0] > groups[-1][-1][0] + 1:
+                groups.append([])
+            groups[-1].append(record)
+        cache = {}
+        for group in groups:
+            merged = {key: sorted({t for record in group for t in record[3][key]})
+                      for key in group[0][3]}
+            decoded = self._query_videos(merged, group[0][2])
+            for _, index, _, queries in group:
+                images = {}
+                for key, timestamps in queries.items():
+                    frames = decoded[key]
+                    if frames.ndim == 3:
+                        frames = frames.unsqueeze(0)
+                    positions = {timestamp: pos for pos, timestamp in enumerate(merged[key])}
+                    selected = frames[[positions[t] for t in timestamps]]
+                    images[key] = selected.squeeze(0).clone()
+                cache[index] = images
+        previous = getattr(self, "_batch_video_frames", None)
+        self._batch_video_frames = cache
+        try:
+            return [self[index] for index in indices]
+        finally:
+            self._batch_video_frames = previous
+
     def __getitem__(self, idx) -> dict:
         # Ensure dataset is loaded when we actually need to read from it
         profile_start = time.perf_counter() if _DATA_PROFILE_DIR else 0.0
@@ -1158,7 +1238,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
             stage_start = time.perf_counter() if _DATA_PROFILE_DIR else 0.0
             current_ts = item["timestamp"].item()
             query_timestamps = self._get_query_timestamps(current_ts, query_indices)
-            video_frames = self._query_videos(query_timestamps, ep_idx)
+            cached_videos = getattr(self, "_batch_video_frames", None)
+            video_frames = (cached_videos[idx] if cached_videos is not None and idx in cached_videos
+                            else self._query_videos(query_timestamps, ep_idx))
             item = {**video_frames, **item}
             videos_s = time.perf_counter() - stage_start if _DATA_PROFILE_DIR else 0.0
         else:
@@ -1172,6 +1254,26 @@ class LeRobotDataset(torch.utils.data.Dataset):
             image_transform_s = time.perf_counter() - stage_start if _DATA_PROFILE_DIR else 0.0
         else:
             image_transform_s = 0.0
+
+        # Per-sample chunk-relative EEF action transform (worker-side, parallel
+        # across DataLoader workers). Equivalent to the policy preprocessor's
+        # SmolVLARelativeEEFChunkProcessor applied per batch in the main
+        # process; the transform depends only on this sample's state + action.
+        if self.relative_eef_actions and "action" in item:
+            stage_start = time.perf_counter() if _DATA_PROFILE_DIR else 0.0
+            from lerobot.policies.smolvla.relative_eef import chunk_to_relative
+
+            state = item.get("observation.state")
+            if state is not None:
+                if not torch.is_tensor(state):
+                    state = torch.as_tensor(state)
+                item["action"] = torch.as_tensor(
+                    chunk_to_relative(state.reshape(-1).cpu().numpy(), item["action"]),
+                    dtype=item["action"].dtype,
+                )
+            eef_s = time.perf_counter() - stage_start if _DATA_PROFILE_DIR else 0.0
+        else:
+            eef_s = 0.0
 
         # Add task as a string
         task_idx = item["task_index"].item()
@@ -1188,6 +1290,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 action_query_s=query_s,
                 videos_s=videos_s,
                 image_transform_s=image_transform_s,
+                eef_s=eef_s,
                 total_getitem_s=time.perf_counter() - profile_start,
             )
 

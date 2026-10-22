@@ -17,6 +17,7 @@ import logging
 from pprint import pformat
 
 import torch
+from torchvision.transforms import v2
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.train import TrainPipelineConfig
@@ -26,7 +27,7 @@ from lerobot.datasets.lerobot_dataset import (
     MultiLeRobotDataset,
 )
 from lerobot.datasets.streaming_dataset import StreamingLeRobotDataset
-from lerobot.datasets.transforms import ImageTransforms
+from lerobot.datasets.transforms import ImageTransforms, ResizeWithPad
 from lerobot.utils.constants import ACTION, OBS_PREFIX, REWARD
 
 IMAGENET_STATS = {
@@ -80,10 +81,21 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
     Returns:
         LeRobotDataset | MultiLeRobotDataset
     """
-    image_transforms = (
-        ImageTransforms(cfg.dataset.image_transforms)
-        if cfg.dataset.image_transforms.enable and not cfg.dataset.image_transforms.use_gpu
-        else None
+    worker_transforms = []
+    if cfg.dataset.image_transforms.enable and not cfg.dataset.image_transforms.use_gpu:
+        worker_transforms.append(ImageTransforms(cfg.dataset.image_transforms))
+    if cfg.dataset.image_transforms.enable and cfg.dataset.image_transforms.pre_resize:
+        worker_transforms.append(
+            ResizeWithPad(*cfg.dataset.image_transforms.pre_resize, pad_value=0)
+        )
+    image_transforms = v2.Compose(worker_transforms) if worker_transforms else None
+
+    # Opt-in: compute the chunk-relative EEF action transform per-sample in
+    # the dataset worker (parallel) instead of the policy preprocessor (main
+    # process, per batch). Only applies to relative-EEF SmolVLA configs.
+    relative_eef_actions = bool(
+        getattr(cfg.policy, "use_relative_eef_actions", False)
+        and getattr(cfg.policy, "eef_relative_in_dataset", False)
     )
 
     if isinstance(cfg.dataset.repo_id, str):
@@ -98,6 +110,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 episodes=cfg.dataset.episodes,
                 delta_timestamps=delta_timestamps,
                 image_transforms=image_transforms,
+                relative_eef_actions=relative_eef_actions,
                 revision=cfg.dataset.revision,
                 video_backend=cfg.dataset.video_backend,
                 tolerance_s=cfg.tolerance_s,
